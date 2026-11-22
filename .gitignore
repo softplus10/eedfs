@@ -1,0 +1,10 @@
+/bin/
+/.runtime/
+*.test
+__pycache__/
+*.pyc
+/target/
+/mnt/
+.env
+.env.*
+!.env.example

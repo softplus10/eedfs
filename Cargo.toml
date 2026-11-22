@@ -1,0 +1,18 @@
+[package]
+name = "eedfs"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+description = "End-to-end encrypted distributed filesystem"
+repository = "https://github.com/softplus10/eedfs"
+publish = false
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+fuser = { version = "0.19", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
