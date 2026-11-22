@@ -112,6 +112,18 @@ incomplete credentials and the absence of an AWS credential fallback. This check
 connectivity only, not full S3 API or conditional-write support. Real-provider
 compatibility requires running `s3 check` with that provider's endpoint and credentials.
 
+## Binary header format
+
+The dependency-free [header codec and format specification](docs/header-format.md)
+cover versioned keyslots, encrypted configuration envelopes, canonical AEAD
+associated-data inputs, and preserved optional extensions. The protected payload
+contains the root inode object key and default inode/data encryption descriptors.
+The root inode will carry its own wrapped inode key.
+
+This is serialization only: it does not implement encryption, unlock, header
+creation/upload, or the inode/chunk formats. Algorithm-specific parameter codecs
+and cryptographic implementations remain separate work.
+
 ## Design direction
 
 - Per-file inodes and independent encrypted data chunks.
