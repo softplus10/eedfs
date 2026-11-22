@@ -8,7 +8,9 @@ repository = "https://github.com/softplus10/eedfs"
 publish = false
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 env_logger = "0.11"
 log = "0.4"
 fuser = { version = "0.19", default-features = false }
