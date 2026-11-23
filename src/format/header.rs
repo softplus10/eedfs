@@ -13,8 +13,8 @@ use serde::{
 const MAGIC: &[u8; 8] = b"EEDFSHDR";
 const CONFIG_MAGIC: &[u8; 8] = b"EEDFSCFG";
 const PREFIX_SIZE: usize = 16;
-/// Version 2 replaces the experimental, hand-written v1 TLV encoding.
-pub const VERSION: u16 = 2;
+/// Version 3 adds protected naming configuration to the Postcard schema.
+pub const VERSION: u16 = 3;
 pub const MAX_SIZE: usize = 1024 * 1024;
 pub const MAX_KEYSLOTS: usize = 64;
 pub const MAX_PARAMETERS: usize = 4096;
@@ -22,7 +22,7 @@ pub const MAX_EXTENSIONS: usize = 64;
 const MAX_NONCE: usize = 64;
 
 /// Nonzero numeric ID plus parameters serialized using that algorithm's schema.
-/// KDF and AEAD IDs have separate namespaces. Never use a Rust enum's position as an ID.
+/// KDF, AEAD and naming-scheme IDs have separate namespaces. Never use a Rust enum's position as an ID.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Algorithm {
     pub id: u16,
@@ -69,6 +69,23 @@ pub struct Header {
     pub extensions: Vec<Extension>,
 }
 
+/// Secret naming configuration stored only in the encrypted protected payload.
+/// Key generation and HMAC evaluation are implemented by the future crypto layer.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamingConfig {
+    pub algorithm: Algorithm,
+    pub key: [u8; 32],
+}
+
+impl fmt::Debug for NamingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NamingConfig")
+            .field("algorithm", &self.algorithm)
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Plaintext to encrypt into the protected region; never upload it directly.
 /// The root inode will carry its own wrapped inode key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +94,7 @@ pub struct ProtectedConfig {
     pub root_inode: String,
     pub inode_encryption: Algorithm,
     pub data_encryption: Algorithm,
+    pub naming: NamingConfig,
     #[serde(deserialize_with = "bounded::<_, _, MAX_EXTENSIONS>")]
     pub extensions: Vec<Extension>,
 }
@@ -253,6 +271,7 @@ impl ProtectedConfig {
         validate_root(&self.root_inode)?;
         self.inode_encryption.validate()?;
         self.data_encryption.validate()?;
+        self.naming.algorithm.validate()?;
         validate_extensions(&self.extensions)
     }
     pub fn encode(&self) -> Result<Vec<u8>> {

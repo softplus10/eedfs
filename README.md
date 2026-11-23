@@ -117,9 +117,9 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 The [Serde/Postcard header codec and format specification](docs/header-format.md)
 cover versioned keyslots, algorithm-specific typed parameter payloads, encrypted
 configuration envelopes, canonical AEAD associated-data inputs, and preserved
-optional extensions. The protected payload
-contains the root inode object key and default inode/data encryption descriptors.
-The root inode will carry its own wrapped inode key.
+optional extensions. The v3 protected payload contains the root inode object key,
+default inode/data encryption descriptors, and a naming-scheme descriptor with its own 32-byte
+secret key. The root inode will carry its own wrapped inode key.
 
 This is serialization only: it does not implement encryption, unlock, header
 creation/upload, or the inode/chunk formats. Algorithm-specific parameter codecs

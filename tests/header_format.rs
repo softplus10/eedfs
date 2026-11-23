@@ -1,6 +1,6 @@
 use eedfs::format::header::{
-    Algorithm, Extension, FormatError, Header, Keyslot, MAX_PARAMETERS, MAX_SIZE, ProtectedConfig,
-    SealedRegion, VERSION,
+    Algorithm, Extension, FormatError, Header, Keyslot, MAX_PARAMETERS, MAX_SIZE, NamingConfig,
+    ProtectedConfig, SealedRegion, VERSION,
 };
 
 // Synthetic ciphertext/tag bytes: these fixtures test serialization, not encryption.
@@ -35,6 +35,10 @@ fn config() -> ProtectedConfig {
         root_inode: "root-object-key".into(),
         inode_encryption: algorithm(1),
         data_encryption: algorithm(1),
+        naming: NamingConfig {
+            algorithm: algorithm(1),
+            key: [0x77; 32],
+        },
         extensions: Vec::new(),
     }
 }
@@ -46,14 +50,14 @@ fn golden(text: &str) -> Vec<u8> {
 
 #[test]
 fn header_matches_independently_encoded_wire_fixture() {
-    let bytes = golden(include_str!("fixtures/header-v2.hex"));
+    let bytes = golden(include_str!("fixtures/header-v3.hex"));
     assert_eq!(header().encode().unwrap(), bytes);
     assert_eq!(Header::decode(&bytes).unwrap(), header());
 }
 
 #[test]
 fn protected_config_matches_wire_fixture_without_a_root_key_field() {
-    let bytes = golden(include_str!("fixtures/header-config-v2.hex"));
+    let bytes = golden(include_str!("fixtures/header-config-v3.hex"));
     assert_eq!(config().encode().unwrap(), bytes);
     assert_eq!(ProtectedConfig::decode(&bytes).unwrap(), config());
 }
@@ -282,11 +286,20 @@ fn unchecked_frame<T: serde::Serialize>(magic: &[u8; 8], value: &T) -> Vec<u8> {
 }
 
 #[test]
-fn old_experimental_format_is_rejected_explicitly() {
-    let old = golden(include_str!("fixtures/header-v1.hex"));
+fn old_experimental_formats_are_rejected_explicitly() {
+    for (fixture, version) in [
+        (include_str!("fixtures/header-v1.hex"), 1),
+        (include_str!("fixtures/header-v2.hex"), 2),
+    ] {
+        assert_eq!(
+            Header::decode(&golden(fixture)),
+            Err(FormatError::UnsupportedVersion(version))
+        );
+    }
+    let old = golden(include_str!("fixtures/header-config-v2.hex"));
     assert_eq!(
-        Header::decode(&old),
-        Err(FormatError::UnsupportedVersion(1))
+        ProtectedConfig::decode(&old),
+        Err(FormatError::UnsupportedVersion(2))
     );
 }
 
@@ -360,4 +373,43 @@ fn algorithm_parameters_have_their_own_typed_schema() {
             .decode_parameters::<TestKdfParameters>(42, 1)
             .is_err()
     );
+}
+
+#[test]
+fn naming_key_and_scheme_roundtrip_in_protected_configuration() {
+    let original = config();
+    let mut changed = original.clone();
+    changed.naming.key[0] ^= 1;
+    assert_ne!(original.encode().unwrap(), changed.encode().unwrap());
+    assert_eq!(
+        ProtectedConfig::decode(&changed.encode().unwrap()).unwrap(),
+        changed
+    );
+    changed.naming.algorithm = Algorithm::from_parameters(77, 1, &()).unwrap();
+    assert_eq!(
+        ProtectedConfig::decode(&changed.encode().unwrap()).unwrap(),
+        changed
+    );
+}
+
+#[test]
+fn invalid_naming_descriptors_are_rejected_on_encode_and_decode() {
+    let mut value = config();
+    value.naming.algorithm.id = 0;
+    assert!(value.encode().is_err());
+    assert!(ProtectedConfig::decode(&unchecked_frame(b"EEDFSCFG", &value)).is_err());
+    value.naming.algorithm.id = 1;
+    value.naming.algorithm.parameters = vec![0; MAX_PARAMETERS + 1];
+    assert!(value.encode().is_err());
+    assert!(ProtectedConfig::decode(&unchecked_frame(b"EEDFSCFG", &value)).is_err());
+}
+
+#[test]
+fn debug_output_redacts_the_naming_secret_including_in_parent_config() {
+    let value = config();
+    let secret = format!("{:?}", value.naming.key);
+    for debug in [format!("{:?}", value.naming), format!("{value:?}")] {
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&secret));
+    }
 }
