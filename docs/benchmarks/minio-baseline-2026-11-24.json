@@ -1,0 +1,38 @@
+[
+  {
+    "case": "s3_put",
+    "mib": 1024,
+    "chunk_mib": 8,
+    "jobs": 8,
+    "seconds": 1.583158,
+    "mib_s": 646.809,
+    "prefix": "baseline-360393819b1f1870f18b044c107d1534/"
+  },
+  {
+    "case": "s3_get_verified",
+    "mib": 1024,
+    "chunk_mib": 8,
+    "jobs": 8,
+    "seconds": 0.462991,
+    "mib_s": 2211.706,
+    "prefix": "baseline-360393819b1f1870f18b044c107d1534/"
+  },
+  {
+    "case": "s3_put",
+    "mib": 10240,
+    "chunk_mib": 8,
+    "jobs": 8,
+    "seconds": 16.710162,
+    "mib_s": 612.801,
+    "prefix": "baseline-572ec211e77770f539597d3a1e2afc82/"
+  },
+  {
+    "case": "s3_get_verified",
+    "mib": 10240,
+    "chunk_mib": 8,
+    "jobs": 8,
+    "seconds": 5.156132,
+    "mib_s": 1985.985,
+    "prefix": "baseline-572ec211e77770f539597d3a1e2afc82/"
+  }
+]

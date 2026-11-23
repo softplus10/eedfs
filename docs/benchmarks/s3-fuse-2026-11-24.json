@@ -1,0 +1,101 @@
+{
+  "prefix": "fuse-bench-8d1ad38ff87342bb89fbe0952f1b1e52/",
+  "chunk_size": 8388608,
+  "parallelism": 8,
+  "results": [
+    {
+      "case": "correctness",
+      "passed": true,
+      "checks": [
+        "cross-client",
+        "nested-directory",
+        "overwrite",
+        "truncate",
+        "sparse-gap",
+        "stale-writer-conflict",
+        "unlink",
+        "remount"
+      ]
+    },
+    {
+      "case": "shared-directory-3-clients-4KiB-files",
+      "files": 60,
+      "seconds": 1.1252077590033878,
+      "files_s": 53.323485836200454,
+      "verified": true
+    },
+    {
+      "case": "64MiB-write-4KiB-syscalls-fsync",
+      "bytes": 67108864,
+      "seconds": 0.36664629098959267,
+      "mib_s": 174.5551545803491,
+      "stage_seconds": 0.23232981300679967,
+      "fsync_seconds": 0.1342719710082747,
+      "sha256": "980ca90c449397ba563902d9b3db446ef416cd112ba382cdf5d130c90336a6c9"
+    },
+    {
+      "case": "4KiB-random-overwrite-fsync",
+      "operations": 32,
+      "bytes": 131072,
+      "seconds": 2.995881201000884,
+      "ops_s": 10.681331419052674,
+      "verified": true
+    },
+    {
+      "case": "sequential-write-fsync",
+      "bytes": 10737418240,
+      "seconds": 34.928401590004796,
+      "mib_s": 293.1711596825635,
+      "stage_seconds": 10.030848661001073,
+      "fsync_seconds": 24.89723261099425,
+      "sha256": "7b0b56d7d17c8c005483772be0943d394585070bd1140f25fa71e7db7ce02b5d"
+    },
+    {
+      "case": "sequential-read-remounted-client",
+      "bytes": 10737418240,
+      "seconds": 46.77781929899356,
+      "mib_s": 218.90716911252673,
+      "sha256": "7b0b56d7d17c8c005483772be0943d394585070bd1140f25fa71e7db7ce02b5d"
+    },
+    {
+      "case": "sequential-read-warm-open-handle",
+      "bytes": 10737418240,
+      "seconds": 14.144902931002434,
+      "mib_s": 723.9356855221843,
+      "sha256": "7b0b56d7d17c8c005483772be0943d394585070bd1140f25fa71e7db7ce02b5d"
+    },
+    {
+      "case": "parallel-write-fsync-3-clients",
+      "bytes": 1610612736,
+      "seconds": 2.6084431219787803,
+      "mib_s": 588.8570032666771,
+      "clients": [
+        {
+          "bytes": 536870912,
+          "seconds": 2.604741026996635,
+          "mib_s": 196.56464680880595,
+          "stage_seconds": 1.2690781299897935,
+          "fsync_seconds": 1.3355557910108473,
+          "sha256": "112c1b91348c7b9b90899881e81d9e8a6d8de325f36c4f7f938ee24759f5ba42"
+        },
+        {
+          "bytes": 536870912,
+          "seconds": 2.352024262014311,
+          "mib_s": 217.68482930593373,
+          "stage_seconds": 0.7343403920240235,
+          "fsync_seconds": 1.6175085009890608,
+          "sha256": "4343f6ee26da0285abc6fc4a2ca62213490d58c912feb0c2e422ae94f20c2690"
+        },
+        {
+          "bytes": 536870912,
+          "seconds": 2.341779681009939,
+          "mib_s": 218.63713489015748,
+          "stage_seconds": 0.7504822780028917,
+          "fsync_seconds": 1.5912409499869682,
+          "sha256": "6a08dc302bf9ac7dccfc97295815b69f4716efd22e70701f81f98c746db17632"
+        }
+      ],
+      "verified": true
+    }
+  ]
+}

@@ -6,7 +6,9 @@ EEDFS is a Rust/FUSE filesystem targeting shared, S3-compatible object storage.
 The experimental `format` / `mount-s3` commands provide encrypted S3-backed
 file and directory operations, fsync commits and remount persistence. The older
 `mount` command remains a read-only development scaffold. See the
-[S3/FUSE guide](docs/s3-fuse.md) for setup, supported behavior and limitations.
+[S3/FUSE guide](docs/s3-fuse.md) for setup, supported behavior and limitations,
+and the [MinIO/filesystem benchmark](docs/benchmarks/s3-fuse-2026-11-24.md) for
+10 GiB and three-client results.
 Production POSIX semantics, same-file conflict merging and safe GC remain future work.
 
 ## Development environment
