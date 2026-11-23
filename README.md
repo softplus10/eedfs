@@ -114,9 +114,10 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 
 ## Binary header format
 
-The dependency-free [header codec and format specification](docs/header-format.md)
-cover versioned keyslots, encrypted configuration envelopes, canonical AEAD
-associated-data inputs, and preserved optional extensions. The protected payload
+The [Serde/Postcard header codec and format specification](docs/header-format.md)
+cover versioned keyslots, algorithm-specific typed parameter payloads, encrypted
+configuration envelopes, canonical AEAD associated-data inputs, and preserved
+optional extensions. The protected payload
 contains the root inode object key and default inode/data encryption descriptors.
 The root inode will carry its own wrapped inode key.
 

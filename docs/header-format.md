@@ -1,182 +1,202 @@
-# EEDFS binary header, version 1
+# EEDFS binary header, version 2
 
-This specifies the initial header container and its extensibility rules.
-`src/format/header.rs` implements the codec using the Rust standard library only:
-no Serde, JSON, native struct dumps, or new dependencies. This is an early format,
-not a claim of a completed or reviewed cryptographic protocol.
+The logical header/keyslot model is unchanged. Serde derives and the stable
+Postcard 1.x binary format now serialize the payloads and authentication inputs.
+Only the 16-byte discovery prefix is hand-encoded. No JSON or native Rust memory
+layout appears on disk. Postcard uses only its `alloc` feature; Serde provides
+derives. These are purposeful dependencies for serialization, not cryptography.
+
+Version 2 is intentionally incompatible with the experimental hand-written v1
+TLV encoding. The codec rejects v1 explicitly instead of silently reinterpreting
+it. No header upload/unlock workflow has shipped, and no migration tool is
+provided. Original v1 fixtures remain as version-rejection regression inputs.
 
 The codec does **not** derive keys, encrypt, authenticate, upload, or unlock a
-filesystem. Ciphertext and algorithm parameters are bounded opaque bytes. A
-successfully decoded header remains untrusted until authenticated by a future
-cryptographic implementation. No CLI currently writes these headers.
+filesystem. Decoded ciphertext and algorithm parameters remain untrusted.
 
-## Contents
+## Logical contents
 
-The public header contains the filesystem ID, an array of keyslots, the encrypted
-configuration envelope, and optional extension records. Each keyslot contains a
-stable slot ID, a KDF descriptor, a master-key wrapping envelope, and extensions.
-The master key itself must never be stored in plaintext in the public header.
+The public header contains a filesystem ID, keyslot array, encrypted configuration
+envelope, and extensions. Each slot has a stable ID, KDF descriptor, wrapped
+master-key envelope, and extensions. Plaintext master keys do not belong here.
 
 The protected configuration contains **only the root inode's S3 object key and
-default inode/data encryption descriptors**, plus extensions. It is serialized,
-then encrypted into the public header's protected region. It is not a separate
-S3 object. It contains no root inode key: the root inode envelope will carry its
-own master-key-wrapped inode key. Endpoint, bucket, credentials, directory
-contents, inode layout, and chunk indexes are outside this format.
+default inode/data encryption descriptors**, plus extensions. It is encoded and
+then encrypted into the header, not stored as another S3 object. The root inode
+will carry its own wrapped inode key. S3 credentials, endpoint, bucket, directory
+contents, inode internals, and chunk indexes are outside this format.
 
-## Integer and byte encoding
-
-All integers use fixed-width unsigned little-endian encoding. No native `usize`,
-pointers, padding, Rust enum layout, or alignment requirements appear on disk.
-A `blob` is `length: u32` followed by exactly that many bytes. Strings are UTF-8
-blobs. IDs are opaque 16-byte values, with no dependence on a UUID library.
-
-Both outer containers start with:
+## Discovery prefix
 
 | Offset | Size | Field |
 | --- | --- | --- |
-| 0 | 8 | Magic: ASCII `EEDFSHDR` or `EEDFSCFG` |
-| 8 | 2 | Format version: 1 |
+| 0 | 8 | ASCII `EEDFSHDR` or `EEDFSCFG` |
+| 8 | 2 | Container version: 2, unsigned little-endian |
 | 10 | 2 | Reserved flags: 0 |
-| 12 | 4 | Body length, excluding this 16-byte prefix |
-| 16 | variable | Body |
+| 12 | 4 | Postcard payload length, unsigned little-endian |
+| 16 | variable | Postcard payload |
 
-The exact declared length is required. Trailing bytes, unknown versions, and
-nonzero reserved flags are errors.
+The complete input must match the declared length exactly. The decoder also
+rejects bytes left after the Postcard value and noncanonical encodings by
+comparing against a re-serialization. Unknown versions and flags are errors.
 
-## TLV records
+## Postcard schema
 
-A record is `type: u16, flags: u16, length: u32, value: [u8; length]`.
-Flag bit 0 means required; all other flag bits must be zero. Required core
-records occur exactly once, in the order below, with flags equal to 1.
+Fields below are encoded in the listed order. Postcard structs/tuples have no
+field names or field count. Unsigned integers use Postcard's unsigned varints;
+`u8` and fixed byte arrays are raw bytes. Strings and vectors have varint length
+prefixes. Rust struct memory layout, pointers, padding, and native enum positions
+are never stored.
 
-Extension types range from `0x8000` to `0xffff`. They follow the core fields in
-strictly increasing type order; duplicates are errors. An unknown optional
-extension (flags 0) is retained byte-for-byte in the model and on re-encoding.
-An unknown required extension (flags 1) is rejected. Writers in this version
-create optional extensions only. Future changes affecting security or semantics
-must use understood required fields/extensions or a new format version, rather
-than hiding mandatory behavior in an optional field.
+```text
+Header {
+    filesystem_id: [u8; 16],
+    keyslots: Vec<Keyslot>,
+    protected: SealedRegion,
+    extensions: Vec<Extension>,
+}
+Keyslot {
+    id: [u8; 16],
+    kdf: Algorithm,
+    wrapped_master_key: SealedRegion,
+    extensions: Vec<Extension>,
+}
+Algorithm {
+    id: u16,
+    parameters: Vec<u8>,
+}
+SealedRegion {
+    algorithm: Algorithm,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+Extension {
+    kind: u16,
+    required: bool,
+    value: Vec<u8>,
+}
+ProtectedConfig {
+    root_inode: String,
+    inode_encryption: Algorithm,
+    data_encryption: Algorithm,
+    extensions: Vec<Extension>,
+}
+```
 
-These rules apply separately to the public header, each keyslot's extension
-tail, and the protected configuration. Updates must preserve unrecognized
-optional extensions, including inside unchanged keyslots.
+A change to these core fields/order/types requires a container version change.
+Adding a Rust field or a `serde(default)` does not automatically provide wire
+compatibility. Compatible additions use the existing extension vectors. The
+Postcard specification guarantees stability of its format, not evolution of an
+application schema.
 
-## Public header body
+## Algorithm-specific parameters versus extensions
 
-1. Filesystem ID: 16 raw bytes.
-2. Required record type 1: keyslot array.
-3. Required record type 2: protected `SealedRegion`.
-4. Optional extension records.
+`Algorithm.parameters` is owned by the selected algorithm, not a global bag of
+extensions. KDF and AEAD IDs have separate namespaces; zero is reserved. Stable
+numeric IDs will be assigned when the cryptographic implementations are added.
+Unknown nonzero descriptors survive container decoding, but cannot be executed.
+The golden fixtures' ID 1 descriptors and ciphertext are synthetic test data.
 
-The keyslot array begins with a `u32` count, then one blob per slot. Each slot
-blob contains:
+`Algorithm::from_parameters(id, schema_version, &typed_parameters)` stores a
+Postcard tuple `(schema_version: u16, typed_parameters)`, bounded to 4096 bytes.
+`decode_parameters::<T>(expected_id, expected_schema_version)` requires the
+expected ID/version, exact consumption, and canonical encoding. The algorithm
+module defines `T`, its supported version, resource bounds, and semantic checks.
+Generic decoding does not run a KDF or prove the parameters are safe to use.
 
-1. Slot ID: 16 raw bytes, unique within the header.
-2. KDF `Algorithm` descriptor.
-3. `SealedRegion` containing the wrapped master key.
-4. Optional extension records.
+For example, a future Argon2id parameter struct would contain a salt and memory,
+iteration, and parallelism settings. An AEAD with no algorithm-specific settings
+can use a unit struct. Every slot can select different algorithms/settings; the
+header container need not grow another Rust enum variant for each algorithm.
+Do not serialize an implementation enum's positional discriminant as a stable
+algorithm ID. Incompatible parameter changes require a new understood parameter
+schema version or algorithm ID.
 
-An `Algorithm` descriptor is `id: u16, parameters: blob`. Zero is reserved.
-KDF and AEAD IDs occupy separate namespaces. Algorithm implementations must
-specify the parameter schema and validate supported IDs, parameter versions,
-key sizes, and resource limits before use. This codec deliberately preserves
-unknown nonzero algorithm descriptors for inspection and transport; this does
-**not** make an unknown algorithm usable. Algorithm registry assignments and
-algorithm-specific parameter codecs will be specified with the crypto code.
-The golden fixtures use synthetic ID 1 descriptors, not operational crypto.
+Nonce and tag are **not extensions or static algorithm parameters**: each
+`SealedRegion` has its own nonce, and ciphertext includes the appended tag.
+Wrapping and protected-configuration encryption therefore have separate nonces
+and tags. Defaults do not contain reusable nonces. Future inode/chunk envelopes
+must identify their suite or immutable configuration version so changing defaults
+does not reinterpret existing ciphertext.
 
-A `SealedRegion` is:
-
-1. AEAD `Algorithm` descriptor.
-2. Nonce: blob.
-3. Ciphertext with its authentication tag appended: blob.
-
-The wrapping and configuration encryptions each have their own nonce and tag.
-Nonces are not secret. The minimum encoded ciphertext/tag length is 16 bytes;
-the exact nonce/tag/key lengths must be checked by the selected algorithm.
-For the proposed XChaCha20-Poly1305 suite, these will be a 24-byte nonce and a
-16-byte tag. This container alone does not enforce or implement that suite.
-
-## Protected configuration body
-
-1. Required record type 1: root inode object key, UTF-8, 1–1024 bytes.
-2. Required record type 2: inode encryption `Algorithm` followed by data
-   encryption `Algorithm`.
-3. Optional extension records.
-
-The descriptors contain filesystem defaults, not reusable encryption nonces.
-Every inode/chunk encryption must use its own nonce as required by its suite.
-Defaults apply to newly created objects. Future inode/chunk envelopes must carry
-an explicit suite ID or an immutable configuration-version reference; changing
-these defaults must not reinterpret existing ciphertext under a different suite.
-Names and extent mappings remain in the future inode/directory formats.
+Extensions are separate application-format additions. Types are unique,
+strictly increasing, and in `0x8000..=0xffff`. Unknown optional records are
+preserved, including those inside keyslots; unknown required records are rejected.
+Current writers emit optional records only. Security-critical behavior must not
+be hidden in an optional record an old reader can ignore.
 
 ## Authentication inputs
 
-The codec defines canonical additional authenticated data (AAD) byte strings.
-These are inputs to AEAD, **not** authentication tags, hashes, or signatures.
-The domain labels include the terminating zero byte. All fields use the same
-encodings and extension order defined above.
+These are canonical AAD inputs to future AEAD code, not MACs or signatures.
+Domain labels are raw ASCII including their terminating zero byte. Remaining
+values are encoded as the following Postcard tuples, with no discovery prefix.
 
 `Keyslot::wrapping_aad(filesystem_id)`:
 
 ```text
-"EEDFS/keyslot\0"
-version: u16
-filesystem ID: 16 bytes
-slot ID: 16 bytes
-KDF descriptor
-wrapping algorithm descriptor
-wrapping nonce: blob
-slot extensions: TLV sequence
+raw "EEDFS/keyslot\0" || Postcard((
+    container_version: u16,
+    filesystem_id: [u8; 16],
+    slot_id: [u8; 16],
+    kdf: Algorithm,
+    wrapping_algorithm: Algorithm,
+    wrapping_nonce: Vec<u8>,
+    slot_extensions: Vec<Extension>,
+))
 ```
 
 `Header::protected_aad()`:
 
 ```text
-"EEDFS/header-config\0"
-version: u16
-filesystem ID: 16 bytes
-keyslot array: blob (including the wrapped keys and their envelopes)
-protected-region algorithm descriptor
-protected-region nonce: blob
-header extensions: TLV sequence
+raw "EEDFS/header-config\0" || Postcard((
+    container_version: u16,
+    filesystem_id: [u8; 16],
+    keyslots: Vec<Keyslot>,
+    protected_algorithm: Algorithm,
+    protected_nonce: Vec<u8>,
+    header_extensions: Vec<Extension>,
+))
 ```
 
-A future crypto layer must derive distinct master-key-based keys for header
-protection and other purposes; it must not reuse a key/nonce pair for different
-plaintexts. Wrapped-key ciphertext is excluded from its own AAD, and protected
-configuration ciphertext is excluded from its own AAD: AEAD already authenticates
-the ciphertext. The format version, known flags, and length rules are enforced
-by the parser; interpretation-changing public metadata is bound by the AAD.
+Ciphertext is excluded from its own AAD because AEAD authenticates it directly.
+The protected configuration's AAD includes the wrapped-key ciphertexts as part
+of the slot array. Valid flags, canonical encoding, and exact lengths are enforced
+by the parser; interpretation-changing metadata is bound by the AAD.
 
-Adding/removing/reordering slots or changing public metadata requires generating
-new protected-region ciphertext/tag with a fresh nonce. Changing a slot's own
-wrapping metadata requires rewrapping that slot too. A subsequent S3 update must
-use the previously observed ETag in a conditional PUT. AAD does not provide
-rollback protection; a valid old header can still be replayed without an
-external trusted freshness mechanism. Slot removal cannot revoke an already
-copied old header/master key.
+Adding/removing/reordering slots or changing public metadata requires fresh
+protected-region encryption/authentication. Changing a slot's wrapping metadata
+requires rewrapping that slot as well. A future S3 header update must use ETag
+conditional PUT. Separate purpose-derived keys and fresh nonces remain mandatory.
+Valid old headers can still be replayed without external trusted freshness; slot
+removal cannot revoke an already copied header/master key.
 
-## Limits and defensive decoding
+## Defensive decoding and limits
 
-- At most 1 MiB per complete encoded header or protected configuration.
-- 1–64 keyslots with unique slot IDs.
-- At most 4096 parameter bytes per algorithm descriptor.
-- At most 64 nonce bytes and 64 extensions per extension container.
-- Lengths must fit in the enclosing slice before data is copied.
-- Before invoking a KDF, the future unlock layer must validate and bound its
-  memory, work, parallelism, and output length. These are not validated by merely
-  decoding an opaque algorithm descriptor.
+- 1 MiB per complete encoded header/configuration.
+- 1–64 slots with unique IDs; 64 extensions per extension container.
+- 4096 parameter bytes and 64 nonce bytes per descriptor/envelope.
+- UTF-8 root inode object key, 1–1024 bytes.
+- At least 16 ciphertext/tag bytes; exact suite lengths are future crypto checks.
 
-Neither ciphertext nor KDF parameters should be logged by production callers.
-Future cryptographic APIs should also manage secret-memory lifetime explicitly.
+Serde sequence visitors reject excessive declared vector lengths before reserving
+memory and enforce bounds as elements are read. The root-key visitor validates
+its borrowed string before allocating. Input size and framing are checked before
+Postcard decoding. Encoding measures the serialized size with Postcard's `Size`
+flavor before allocating the output. Validation remains an application concern;
+using a serialization library does not replace it. Algorithm-specific deserializers
+must likewise bound allocations and KDF memory/work before invocation.
 
-## Compatibility tests
+Use the public `encode`/`decode` methods for stored containers, not bare
+`postcard::from_bytes::<Header>`: bare Serde decoding bypasses the framing and
+semantic checks. Likewise, plaintext `ProtectedConfig` must never be uploaded.
 
-`tests/header_format.rs` checks independently generated little-endian golden
-fixtures, every truncated prefix, malformed lengths, duplicate IDs/fields,
-optional-extension preservation, mandatory-extension rejection, size limits,
-and the public-metadata/AAD relationship. Fixture ciphertext and tags are fake;
-these tests are not encryption tests.
+## Tests
+
+Golden fixtures are independently encoded against the documented Postcard schema.
+Regression tests cover truncation, trailing/noncanonical bytes, resource limits,
+IDs/versions, optional/required extensions, typed algorithm parameter schemas,
+and AAD binding. Fixture ciphertext/tags are fake. No test claims to validate an
+actual encryption algorithm.
+
+References: [Postcard wire format](https://postcard.jamesmunns.com/wire-format),
+[Serde data model](https://serde.rs/data-model.html).

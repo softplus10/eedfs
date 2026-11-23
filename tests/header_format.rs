@@ -1,6 +1,6 @@
 use eedfs::format::header::{
     Algorithm, Extension, FormatError, Header, Keyslot, MAX_PARAMETERS, MAX_SIZE, ProtectedConfig,
-    SealedRegion,
+    SealedRegion, VERSION,
 };
 
 // Synthetic ciphertext/tag bytes: these fixtures test serialization, not encryption.
@@ -46,14 +46,14 @@ fn golden(text: &str) -> Vec<u8> {
 
 #[test]
 fn header_matches_independently_encoded_wire_fixture() {
-    let bytes = golden(include_str!("fixtures/header-v1.hex"));
+    let bytes = golden(include_str!("fixtures/header-v2.hex"));
     assert_eq!(header().encode().unwrap(), bytes);
     assert_eq!(Header::decode(&bytes).unwrap(), header());
 }
 
 #[test]
 fn protected_config_matches_wire_fixture_without_a_root_key_field() {
-    let bytes = golden(include_str!("fixtures/header-config-v1.hex"));
+    let bytes = golden(include_str!("fixtures/header-config-v2.hex"));
     assert_eq!(config().encode().unwrap(), bytes);
     assert_eq!(ProtectedConfig::decode(&bytes).unwrap(), config());
 }
@@ -79,6 +79,7 @@ fn rejects_every_truncated_prefix_and_trailing_bytes() {
 #[test]
 fn preserves_optional_extensions_at_all_levels() {
     let extension = Extension {
+        required: false,
         kind: 0x8001,
         value: vec![0, 255, 7],
     };
@@ -100,14 +101,14 @@ fn preserves_optional_extensions_at_all_levels() {
 fn rejects_unknown_required_extensions() {
     let mut value = header();
     value.extensions.push(Extension {
+        required: false,
         kind: 0x8001,
         value: vec![7],
     });
-    let mut bytes = value.encode().unwrap();
-    let flags = bytes.len() - 9 + 2;
-    bytes[flags..flags + 2].copy_from_slice(&1_u16.to_le_bytes());
+    value.extensions[0].required = true;
+    assert_eq!(value.encode(), Err(FormatError::RequiredExtension(0x8001)));
     assert_eq!(
-        Header::decode(&bytes),
+        Header::decode(&unchecked_frame(b"EEDFSHDR", &value)),
         Err(FormatError::RequiredExtension(0x8001))
     );
 }
@@ -115,6 +116,7 @@ fn rejects_unknown_required_extensions() {
 #[test]
 fn rejects_duplicate_and_out_of_order_extensions() {
     let extension = Extension {
+        required: false,
         kind: 0x8001,
         value: Vec::new(),
     };
@@ -135,10 +137,10 @@ fn rejects_bad_framing_and_unbounded_lengths_before_allocation() {
     bad[0] ^= 1;
     assert!(Header::decode(&bad).is_err());
     let mut bad = bytes.clone();
-    bad[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    bad[8..10].copy_from_slice(&(VERSION + 1).to_le_bytes());
     assert_eq!(
         Header::decode(&bad),
-        Err(FormatError::UnsupportedVersion(2))
+        Err(FormatError::UnsupportedVersion(VERSION + 1))
     );
     let mut bad = bytes.clone();
     bad[10] = 1;
@@ -146,9 +148,11 @@ fn rejects_bad_framing_and_unbounded_lengths_before_allocation() {
     let mut bad = bytes.clone();
     bad[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(Header::decode(&bad).is_err());
-    let mut bad = bytes;
-    bad[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert!(Header::decode(&bad).is_err());
+    // An enormous declared slot count in a tiny payload must fail before allocation.
+    let mut body = vec![0x11; 16];
+    body.extend_from_slice(&[0xff; 9]);
+    body.push(1);
+    assert!(Header::decode(&frame_body(b"EEDFSHDR", &body)).is_err());
     assert_eq!(
         Header::decode(&vec![0; MAX_SIZE + 1]),
         Err(FormatError::TooLarge)
@@ -160,14 +164,7 @@ fn rejects_duplicate_slots_on_encode_and_decode() {
     let mut value = header();
     value.keyslots.push(value.keyslots[0].clone());
     assert!(value.encode().is_err());
-    value.keyslots[1].id = [0x44; 16];
-    let mut bytes = value.encode().unwrap();
-    let position = bytes
-        .windows(16)
-        .position(|window| window == [0x44; 16])
-        .unwrap();
-    bytes[position..position + 16].fill(0x22);
-    assert!(Header::decode(&bytes).is_err());
+    assert!(Header::decode(&unchecked_frame(b"EEDFSHDR", &value)).is_err());
     value.keyslots.clear();
     assert!(value.encode().is_err());
 }
@@ -193,7 +190,7 @@ fn root_locator_must_fit_an_s3_object_key() {
     value.root_inode = "x".repeat(1025);
     assert!(value.encode().is_err());
     let mut bytes = config().encode().unwrap();
-    bytes[24] = 0xff; // First byte of the required root object's UTF-8 key.
+    bytes[17] = 0xff; // Root key follows its one-byte Postcard string length.
     assert!(ProtectedConfig::decode(&bytes).is_err());
 }
 
@@ -232,6 +229,7 @@ fn authentication_inputs_bind_public_metadata_and_use_separate_domains() {
     changes.push(changed);
     let mut changed = original.clone();
     changed.extensions.push(Extension {
+        required: false,
         kind: 0x8000,
         value: vec![1],
     });
@@ -269,4 +267,97 @@ fn mutated_inputs_never_panic_and_accepted_headers_remain_canonical() {
             }
         }
     }
+}
+
+fn frame_body(magic: &[u8; 8], body: &[u8]) -> Vec<u8> {
+    let mut bytes = magic.to_vec();
+    bytes.extend_from_slice(&VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(body);
+    bytes
+}
+fn unchecked_frame<T: serde::Serialize>(magic: &[u8; 8], value: &T) -> Vec<u8> {
+    frame_body(magic, &postcard::to_allocvec(value).unwrap())
+}
+
+#[test]
+fn old_experimental_format_is_rejected_explicitly() {
+    let old = golden(include_str!("fixtures/header-v1.hex"));
+    assert_eq!(
+        Header::decode(&old),
+        Err(FormatError::UnsupportedVersion(1))
+    );
+}
+
+#[test]
+fn rejects_oversized_deserialized_parameters_and_roots() {
+    let mut value = header();
+    value.keyslots[0].kdf.parameters = vec![0; MAX_PARAMETERS + 1];
+    assert!(Header::decode(&unchecked_frame(b"EEDFSHDR", &value)).is_err());
+    let mut value = config();
+    value.root_inode = "x".repeat(1025);
+    assert!(ProtectedConfig::decode(&unchecked_frame(b"EEDFSCFG", &value)).is_err());
+}
+
+#[test]
+fn rejects_noncanonical_varints_and_bytes_inside_the_frame() {
+    let mut bytes = header().encode().unwrap();
+    // The first algorithm ID follows the filesystem ID, slot count and slot ID.
+    assert_eq!(bytes[49], 1);
+    bytes.splice(49..50, [0x81, 0x00]);
+    let len = (bytes.len() - 16) as u32;
+    bytes[12..16].copy_from_slice(&len.to_le_bytes());
+    assert!(Header::decode(&bytes).is_err());
+    let mut bytes = header().encode().unwrap();
+    bytes.push(0);
+    let len = (bytes.len() - 16) as u32;
+    bytes[12..16].copy_from_slice(&len.to_le_bytes());
+    assert!(Header::decode(&bytes).is_err());
+}
+
+#[test]
+fn algorithm_parameters_have_their_own_typed_schema() {
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct TestKdfParameters {
+        salt: [u8; 16],
+        iterations: u32,
+    }
+    // Test-only numeric ID; actual algorithm assignments remain future crypto work.
+    let params = TestKdfParameters {
+        salt: [7; 16],
+        iterations: 3,
+    };
+    let descriptor = Algorithm::from_parameters(42, 1, &params).unwrap();
+    assert_eq!(
+        descriptor
+            .decode_parameters::<TestKdfParameters>(42, 1)
+            .unwrap(),
+        params
+    );
+    assert!(
+        descriptor
+            .decode_parameters::<TestKdfParameters>(43, 1)
+            .is_err()
+    );
+    assert!(
+        descriptor
+            .decode_parameters::<TestKdfParameters>(42, 2)
+            .is_err()
+    );
+    assert!(Algorithm::from_parameters(42, 0, &params).is_err());
+    let mut noncanonical = descriptor.clone();
+    noncanonical.parameters.splice(0..1, [0x81, 0x00]);
+    assert!(
+        noncanonical
+            .decode_parameters::<TestKdfParameters>(42, 1)
+            .is_err()
+    );
+    let mut trailing = descriptor;
+    trailing.parameters.push(0);
+    assert!(
+        trailing
+            .decode_parameters::<TestKdfParameters>(42, 1)
+            .is_err()
+    );
 }
