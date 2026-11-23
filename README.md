@@ -121,9 +121,21 @@ optional extensions. The v3 protected payload contains the root inode object key
 default inode/data encryption descriptors, and a naming-scheme descriptor with its own 32-byte
 secret key. The root inode will carry its own wrapped inode key.
 
-This is serialization only: it does not implement encryption, unlock, header
-creation/upload, or the inode/chunk formats. Algorithm-specific parameter codecs
-and cryptographic implementations remain separate work.
+This is serialization only: it does not implement encryption, unlock, or header
+creation/upload. Algorithm-specific cryptographic implementations remain separate work.
+
+## Inode and chunk formats
+
+The [object format codecs](docs/object-format.md) define an inode envelope with a
+wrapped per-inode key and encrypted body, plus an immutable data-chunk envelope.
+The minimal inode body contains an ID, kind, generation, and either inline bytes
+or an ordered list of S3 chunk keys/plaintext lengths. Reference helpers construct
+chunk authentication context and check decrypted lengths. Extent trees, POSIX
+attributes, directory-entry encoding, and filesystem operations remain deferred.
+
+These codecs do not connect the FUSE scaffold to S3 or implement encryption or
+S3 object reads/writes. Tests exercise serialized inode/chunk linkage with local
+fixtures, including 8 MiB chunk envelopes, rather than cloud storage or crypto.
 
 ## Design direction
 

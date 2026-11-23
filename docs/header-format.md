@@ -14,7 +14,8 @@ upload/unlock workflow has shipped, and no migration tool is provided. Older
 fixtures remain as version-rejection regression inputs.
 
 The codec does **not** derive keys, encrypt, authenticate, upload, or unlock a
-filesystem. Decoded ciphertext and algorithm parameters remain untrusted.
+filesystem. Shared framing and Serde bounds live in `src/format/codec.rs`; the
+header's v3 wire schema and golden fixtures remain unchanged. Decoded ciphertext and algorithm parameters remain untrusted.
 
 ## Logical contents
 

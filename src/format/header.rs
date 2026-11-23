@@ -3,16 +3,15 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::marker::PhantomData;
 
-use serde::{
-    Deserialize, Deserializer, Serialize,
-    de::{self, DeserializeOwned, SeqAccess, Visitor},
+use super::codec::{
+    bounded, bounded_bytes, decode_value, encode_value, object_key as root_key, serialize_bytes,
 };
+
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 const MAGIC: &[u8; 8] = b"EEDFSHDR";
 const CONFIG_MAGIC: &[u8; 8] = b"EEDFSCFG";
-const PREFIX_SIZE: usize = 16;
 /// Version 3 adds protected naming configuration to the Postcard schema.
 pub const VERSION: u16 = 3;
 pub const MAX_SIZE: usize = 1024 * 1024;
@@ -32,11 +31,14 @@ pub struct Algorithm {
 
 /// Ciphertext includes the authentication tag. Nonces belong here, not in defaults.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SealedRegion {
+pub struct SealedRegion<const MAX_CIPHERTEXT: usize = MAX_SIZE> {
     pub algorithm: Algorithm,
     #[serde(deserialize_with = "bounded::<_, _, MAX_NONCE>")]
     pub nonce: Vec<u8>,
-    #[serde(deserialize_with = "bounded::<_, _, MAX_SIZE>")]
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "bounded_bytes::<_, MAX_CIPHERTEXT>"
+    )]
     pub ciphertext: Vec<u8>,
 }
 
@@ -111,10 +113,12 @@ pub enum FormatError {
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Truncated => write!(f, "truncated header"),
-            Self::TooLarge => write!(f, "header format limit exceeded"),
-            Self::Invalid(reason) => write!(f, "invalid header: {reason}"),
-            Self::UnsupportedVersion(version) => write!(f, "unsupported header version {version}"),
+            Self::Truncated => write!(f, "truncated storage object"),
+            Self::TooLarge => write!(f, "storage format limit exceeded"),
+            Self::Invalid(reason) => write!(f, "invalid storage object: {reason}"),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported storage format version {version}")
+            }
             Self::RequiredExtension(kind) => {
                 write!(f, "unsupported required extension {kind:#06x}")
             }
@@ -131,7 +135,7 @@ impl From<postcard::Error> for FormatError {
 type Result<T> = std::result::Result<T, FormatError>;
 
 impl Algorithm {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         if self.id == 0 || self.parameters.len() > MAX_PARAMETERS {
             return Err(FormatError::Invalid("algorithm descriptor"));
         }
@@ -178,20 +182,20 @@ impl Algorithm {
         Ok(parameters)
     }
 }
-impl SealedRegion {
-    fn validate_descriptor(&self) -> Result<()> {
+impl<const MAX_CIPHERTEXT: usize> SealedRegion<MAX_CIPHERTEXT> {
+    pub(super) fn validate_descriptor(&self) -> Result<()> {
         self.algorithm.validate()?;
         if self.nonce.len() > MAX_NONCE {
             return Err(FormatError::Invalid("nonce length"));
         }
         Ok(())
     }
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         self.validate_descriptor()?;
         if self.ciphertext.len() < 16 {
             return Err(FormatError::Invalid("ciphertext/tag length"));
         }
-        if self.ciphertext.len() > MAX_SIZE {
+        if self.ciphertext.len() > MAX_CIPHERTEXT {
             return Err(FormatError::TooLarge);
         }
         Ok(())
@@ -291,7 +295,7 @@ fn validate_root(root: &str) -> Result<()> {
     }
     Ok(())
 }
-fn validate_extensions(extensions: &[Extension]) -> Result<()> {
+pub(super) fn validate_extensions(extensions: &[Extension]) -> Result<()> {
     if extensions.len() > MAX_EXTENSIONS {
         return Err(FormatError::TooLarge);
     }
@@ -311,107 +315,15 @@ fn validate_extensions(extensions: &[Extension]) -> Result<()> {
     Ok(())
 }
 
-// Only the fixed discovery prefix is hand-encoded; all payloads/AAD use Postcard.
+// Header v3 keeps its original framing and byte layout.
 fn frame<T: Serialize>(magic: &[u8; 8], value: &T) -> Result<Vec<u8>> {
-    let body = encode_value(value, MAX_SIZE - PREFIX_SIZE)?;
-    let mut out = Vec::with_capacity(PREFIX_SIZE + body.len());
-    out.extend_from_slice(magic);
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&body);
-    Ok(out)
+    super::codec::frame(magic, VERSION, MAX_SIZE, value)
 }
 fn unframe<T: DeserializeOwned + Serialize>(magic: &[u8; 8], bytes: &[u8]) -> Result<T> {
-    if bytes.len() > MAX_SIZE {
-        return Err(FormatError::TooLarge);
-    }
-    if bytes.len() < PREFIX_SIZE {
-        return Err(FormatError::Truncated);
-    }
-    if &bytes[..8] != magic {
-        return Err(FormatError::Invalid("magic"));
-    }
-    let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    if version != VERSION {
-        return Err(FormatError::UnsupportedVersion(version));
-    }
-    if bytes[10..12] != [0, 0] {
-        return Err(FormatError::Invalid("reserved flags"));
-    }
-    let len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    if len != bytes.len() - PREFIX_SIZE {
-        return Err(FormatError::Invalid("body length"));
-    }
-    decode_value(&bytes[PREFIX_SIZE..])
-}
-fn encode_value<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<Vec<u8>> {
-    // Measure before allocating, so excessive nested values never build an oversized buffer.
-    let size = postcard::serialize_with_flavor(value, postcard::ser_flavors::Size::default())?;
-    if size > limit {
-        return Err(FormatError::TooLarge);
-    }
-    Ok(postcard::to_allocvec(value)?)
-}
-fn decode_value<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T> {
-    let (value, rest): (T, _) = postcard::take_from_bytes(bytes)?;
-    if !rest.is_empty() {
-        return Err(FormatError::Invalid("trailing Postcard bytes"));
-    }
-    if encode_value(&value, bytes.len())? != bytes {
-        return Err(FormatError::Invalid("noncanonical Postcard encoding"));
-    }
-    Ok(value)
+    super::codec::unframe(magic, VERSION, MAX_SIZE, bytes)
 }
 fn aad<T: Serialize>(domain: &[u8], value: &T) -> Result<Vec<u8>> {
     let mut out = domain.to_vec();
     out.extend_from_slice(&encode_value(value, MAX_SIZE - domain.len())?);
     Ok(out)
-}
-
-// Serde supplies the wire decoder; these visitors enforce application allocation
-// bounds before trusting a declared sequence/string length from an S3 object.
-fn bounded<'de, D, T, const N: usize>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct Bounded<T, const N: usize>(PhantomData<T>);
-    impl<'de, T: Deserialize<'de>, const N: usize> Visitor<'de> for Bounded<T, N> {
-        type Value = Vec<T>;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "a sequence with at most {N} elements")
-        }
-        fn visit_seq<A: SeqAccess<'de>>(
-            self,
-            mut seq: A,
-        ) -> std::result::Result<Self::Value, A::Error> {
-            if seq.size_hint().is_some_and(|count| count > N) {
-                return Err(de::Error::custom("sequence length limit exceeded"));
-            }
-            let mut out = Vec::new();
-            while let Some(value) = seq.next_element()? {
-                if out.len() >= N {
-                    return Err(de::Error::custom("sequence length limit exceeded"));
-                }
-                out.push(value);
-            }
-            Ok(out)
-        }
-    }
-    deserializer.deserialize_seq(Bounded::<T, N>(PhantomData))
-}
-fn root_key<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<String, D::Error> {
-    struct RootKey;
-    impl Visitor<'_> for RootKey {
-        type Value = String;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a 1-1024 byte UTF-8 object key")
-        }
-        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<String, E> {
-            validate_root(value).map_err(E::custom)?;
-            Ok(value.to_owned())
-        }
-    }
-    deserializer.deserialize_str(RootKey)
 }
