@@ -3,10 +3,11 @@
 End-to-end encrypted distributed filesystem. **Early development.**
 
 EEDFS is a Rust/FUSE filesystem targeting shared, S3-compatible object storage.
-The current implementation is a read-only FUSE scaffold exposing `README.txt`.
-An S3 connection check, binary object formats, and in-memory authenticated
-encryption helpers are also available. S3 object reads/writes, persistence, and
-distributed concurrency control are not implemented yet.
+The experimental `format` / `mount-s3` commands provide encrypted S3-backed
+file and directory operations, fsync commits and remount persistence. The older
+`mount` command remains a read-only development scaffold. See the
+[S3/FUSE guide](docs/s3-fuse.md) for setup, supported behavior and limitations.
+Production POSIX semantics, same-file conflict merging and safe GC remain future work.
 
 ## Development environment
 
@@ -125,10 +126,9 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 
 `crypto::objects` creates/unlocks headers, seals/opens inode objects, and seals/opens
 chunks in memory, including shared access using a separately granted inode key.
-All of this remains independent of the read-only FUSE scaffold and S3 connectivity
-check. Old experimental formats are incompatible and rejected. Directory entries,
-POSIX attributes, encryption key lifecycle workflows and filesystem writes remain
-future work. The cryptographic integration has not received a security audit.
+The [S3 volume layer](docs/s3-fuse.md) connects these helpers to writable FUSE
+and encrypted inline directories. Old experimental formats are incompatible and
+rejected. POSIX attributes and encryption key lifecycle workflows remain future work. The cryptographic integration has not received a security audit.
 
 ## Local crypto benchmark
 
@@ -152,7 +152,7 @@ disk I/O. Results measure CPU/allocation costs, not NAS throughput.
 - Metadata conflict detection, merge, and retry.
 - Client-side encryption of object names and contents.
 
-Atomic directory changes, key lifecycle workflows, ambiguous commit recovery, and safe
+Cross-directory atomic changes, key lifecycle workflows, crash recovery, and safe
 reclamation still need to be designed. The scaffold does not implement or
 guarantee these features.
 

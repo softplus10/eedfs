@@ -1,0 +1,167 @@
+//! Requires a disposable S3 bucket. Run explicitly with --ignored --test-threads=1.
+use eedfs::{
+    crypto,
+    format::{
+        directory::{Directory, Entry},
+        inode,
+    },
+    s3::{Connection, ConnectionConfig, PutResult},
+    volume::{Error, Volume},
+};
+use std::{sync::Arc, time::Duration};
+fn connection() -> Connection {
+    Connection::new(ConnectionConfig {
+        bucket: std::env::var("S3_BUCKET").unwrap(),
+        region: "us-east-1".into(),
+        endpoint_url: Some(std::env::var("S3_ENDPOINT_URL").unwrap()),
+        force_path_style: true,
+        timeout: Duration::from_secs(60),
+    })
+    .unwrap()
+}
+fn prefix() -> String {
+    format!(
+        "test-{:x}/",
+        u128::from_le_bytes(crypto::random_array().unwrap())
+    )
+}
+#[test]
+fn directory_payload_validates_names_order_and_framing() {
+    let d = Directory {
+        entries: vec![Entry {
+            name: "hello".into(),
+            id: [1; 16],
+            kind: inode::FILE,
+        }],
+    };
+    assert_eq!(Directory::decode(&d.encode().unwrap()).unwrap(), d);
+    for name in ["", "..", "x/y", "a\0b"] {
+        let invalid = Directory {
+            entries: vec![Entry {
+                name: name.into(),
+                ..d.entries[0].clone()
+            }],
+        };
+        assert!(invalid.encode().is_err());
+    }
+    for end in 0..d.encode().unwrap().len() {
+        assert!(Directory::decode(&d.encode().unwrap()[..end]).is_err());
+    }
+}
+#[tokio::test]
+#[ignore = "requires a disposable real S3/MinIO bucket"]
+async fn conditional_put_rejects_stale_versions() {
+    let c = connection();
+    let key = format!("{}object", prefix());
+    let PutResult::Applied(first) = c.put(&key, vec![1], None).await.unwrap() else {
+        panic!()
+    };
+    assert!(matches!(
+        c.put(&key, vec![2], None).await.unwrap(),
+        PutResult::Conflict
+    ));
+    let PutResult::Applied(_) = c.put(&key, vec![2], Some(&first)).await.unwrap() else {
+        panic!()
+    };
+    assert!(matches!(
+        c.put(&key, vec![3], Some(&first)).await.unwrap(),
+        PutResult::Conflict
+    ));
+    assert_eq!(c.get(&key, 1).await.unwrap().unwrap().bytes, vec![2]);
+    assert!(c.get(&key, 0).await.is_err());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable real S3/MinIO bucket"]
+async fn persistence_cow_sparse_truncate_conflicts_and_directory_merge() {
+    let c = connection();
+    let prefix = prefix();
+    let password = b"integration password";
+    let volume = Volume::format(c.clone(), prefix.clone(), password, 128 * 1024, 4)
+        .await
+        .unwrap();
+    assert!(
+        Volume::format(c.clone(), prefix.clone(), password, 128 * 1024, 4)
+            .await
+            .is_err()
+    );
+    assert!(
+        Volume::open(c.clone(), prefix.clone(), b"wrong", 128 * 1024, 4)
+            .await
+            .is_err()
+    );
+    let cache = std::env::temp_dir().join(format!("eedfs-test-{}", std::process::id()));
+    let loaded = volume
+        .create(volume.root, "data", inode::FILE)
+        .await
+        .unwrap();
+    let id = loaded.body.id;
+    let mut file = volume.file(loaded, &cache).unwrap();
+    let plain: Vec<u8> = (0..400_000).map(|i| (i % 251) as u8).collect();
+    file.write(0, &plain).await.unwrap();
+    file.commit().await.unwrap();
+    drop(file);
+    // New client uses a different write policy. Stored chunks remain variable-sized.
+    let other = Volume::open(c.clone(), prefix.clone(), password, 256 * 1024, 4)
+        .await
+        .unwrap();
+    let mut reader = other.file(other.load(id).await.unwrap(), &cache).unwrap();
+    assert_eq!(reader.read(0, plain.len()).await.unwrap(), plain);
+    reader.write(140_000, b"changed").await.unwrap();
+    reader.commit().await.unwrap();
+    let mut expected = plain.clone();
+    expected[140_000..140_007].copy_from_slice(b"changed");
+    assert_eq!(reader.read(0, expected.len()).await.unwrap(), expected);
+    reader.resize(10).unwrap();
+    reader.resize(400_000).unwrap();
+    reader.commit().await.unwrap();
+    let got = reader.read(0, 400_000).await.unwrap();
+    assert_eq!(&got[..10], &plain[..10]);
+    assert!(got[10..].iter().all(|&b| b == 0));
+    reader.write(700_000, b"tail").await.unwrap();
+    reader.commit().await.unwrap();
+    assert_eq!(
+        reader.read(699_990, 14).await.unwrap(),
+        [vec![0; 10], b"tail".to_vec()].concat()
+    );
+    reader.resize(0).unwrap();
+    reader.commit().await.unwrap();
+    assert_eq!(other.load(id).await.unwrap().body.size().unwrap(), 0);
+    let mut a = volume.file(volume.load(id).await.unwrap(), &cache).unwrap();
+    let mut b = other.file(other.load(id).await.unwrap(), &cache).unwrap();
+    a.write(0, b"winner").await.unwrap();
+    b.write(0, b"loser").await.unwrap();
+    a.commit().await.unwrap();
+    assert!(matches!(b.commit().await, Err(Error::Conflict)));
+    let mut latest = volume.file(volume.load(id).await.unwrap(), &cache).unwrap();
+    assert_eq!(latest.read(0, 6).await.unwrap(), b"winner");
+    let mut jobs = tokio::task::JoinSet::new();
+    for client in 0..3 {
+        let volume = Arc::clone(&volume);
+        jobs.spawn(async move {
+            for i in 0..10 {
+                volume
+                    .create(volume.root, &format!("client-{client}-{i}"), inode::FILE)
+                    .await?;
+            }
+            Ok::<_, Error>(())
+        });
+    }
+    while let Some(result) = jobs.join_next().await {
+        result.unwrap().unwrap();
+    }
+    assert_eq!(volume.list(volume.root).await.unwrap().len(), 31);
+    volume.unlink(volume.root, "data").await.unwrap();
+    assert_eq!(volume.list(volume.root).await.unwrap().len(), 30);
+    // Unlinked inode survives for existing readers; reclamation is deferred.
+    assert!(volume.load(id).await.is_ok());
+    let root = c
+        .get(
+            &volume.inode_name(&volume.root).unwrap(),
+            inode::MAX_INODE_SIZE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!root.bytes.windows(8).any(|w| w == b"client-0"));
+    std::fs::remove_dir(cache).unwrap();
+}

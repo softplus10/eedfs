@@ -1,0 +1,592 @@
+//! Experimental encrypted S3 volume. Publication is durable at commit, not write().
+use crate::{
+    crypto::{self, SecretKey, encryption, kdf, naming, objects},
+    format::{
+        directory::{Directory, Entry},
+        header::{Algorithm, Header, NamingConfig},
+        inode::{self, ChunkRun, ChunkedContent, InodeBody, InodeContent, InodeObject},
+    },
+    s3::{Connection, ConnectionError, PutResult},
+};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    fs::{File, OpenOptions},
+    os::unix::fs::{FileExt, OpenOptionsExt},
+    path::Path,
+    sync::Arc,
+};
+
+#[derive(Debug)]
+pub enum Error {
+    Other(ConnectionError),
+    Conflict,
+    Exists,
+    Missing,
+    NotDirectory,
+    Invalid,
+    TooLarge,
+    NotEmpty,
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Other(e) => e.fmt(f),
+            v => write!(f, "{v:?}"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+impl From<ConnectionError> for Error {
+    fn from(e: ConnectionError) -> Self {
+        Self::Other(e)
+    }
+}
+impl From<crypto::Error> for Error {
+    fn from(e: crypto::Error) -> Self {
+        Self::Other(e.into())
+    }
+}
+impl From<crate::format::header::FormatError> for Error {
+    fn from(e: crate::format::header::FormatError) -> Self {
+        Self::Other(e.into())
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Other(e.into())
+    }
+}
+impl From<tokio::task::JoinError> for Error {
+    fn from(e: tokio::task::JoinError) -> Self {
+        Self::Other(e.into())
+    }
+}
+pub type Result<T> = std::result::Result<T, Error>;
+type ReadTasks = tokio::task::JoinSet<Result<(usize, Piece, zeroize::Zeroizing<Vec<u8>>)>>;
+
+pub struct Volume {
+    pub fs_id: [u8; 16],
+    pub root: [u8; 16],
+    connection: Connection,
+    prefix: String,
+    master: SecretKey,
+    names: NamingConfig,
+    suite: Algorithm,
+    pub chunk_size: usize,
+    pub parallelism: usize,
+}
+pub struct Loaded {
+    pub body: InodeBody,
+    pub key: Arc<SecretKey>,
+    pub suite: Algorithm,
+    pub etag: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Piece {
+    offset: u64,
+    len: u32,
+    allocation: [u8; 16],
+    index: u64,
+}
+fn pieces(body: &InodeBody) -> Vec<Piece> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    if let InodeContent::Chunks(c) = &body.content {
+        for run in &c.runs {
+            for (i, &len) in run.plaintext_lengths.iter().enumerate() {
+                result.push(Piece {
+                    offset,
+                    len,
+                    allocation: run.allocation_id,
+                    index: run.first_chunk + i as u64,
+                });
+                offset += u64::from(len);
+            }
+        }
+    }
+    result
+}
+impl Volume {
+    fn validate_policy(prefix: &str, chunk_size: usize, parallelism: usize) -> Result<()> {
+        if prefix.is_empty()
+            || !prefix.ends_with('/')
+            || prefix.len() > 800
+            || !(inode::MAX_INLINE_SIZE..=crate::format::data_chunk::MAX_CHUNK_PLAINTEXT)
+                .contains(&chunk_size)
+            || !(1..=32).contains(&parallelism)
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+    pub async fn format(
+        connection: Connection,
+        prefix: String,
+        password: &[u8],
+        chunk_size: usize,
+        parallelism: usize,
+    ) -> Result<Arc<Self>> {
+        Self::validate_policy(&prefix, chunk_size, parallelism)?;
+        if connection
+            .get(&format!("{prefix}header"), crate::format::header::MAX_SIZE)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Exists);
+        }
+        let suite = encryption::algorithm(encryption::XCHACHA20_POLY1305)?;
+        let root = crypto::random_array()?;
+        let (header, unlocked) = objects::create_header(
+            password,
+            root,
+            &suite,
+            &kdf::argon2id::Parameters::recommended()?,
+        )?;
+        let volume = Arc::new(Self {
+            fs_id: header.filesystem_id,
+            root,
+            connection,
+            prefix,
+            master: unlocked.master_key,
+            names: unlocked.config.naming.clone(),
+            suite,
+            chunk_size,
+            parallelism,
+        });
+        volume.create_inode(root, inode::DIRECTORY).await?;
+        match volume
+            .connection
+            .put(&format!("{}header", volume.prefix), header.encode()?, None)
+            .await?
+        {
+            PutResult::Applied(_) => Ok(volume),
+            PutResult::Conflict => Err(Error::Exists),
+        }
+    }
+    pub async fn open(
+        connection: Connection,
+        prefix: String,
+        password: &[u8],
+        chunk_size: usize,
+        parallelism: usize,
+    ) -> Result<Arc<Self>> {
+        Self::validate_policy(&prefix, chunk_size, parallelism)?;
+        let stored = connection
+            .get(&format!("{prefix}header"), crate::format::header::MAX_SIZE)
+            .await?
+            .ok_or(Error::Missing)?;
+        let header = Header::decode(&stored.bytes)?;
+        let unlocked = objects::unlock_header(&header, password, &header.keyslots[0].id)?;
+        Ok(Arc::new(Self {
+            fs_id: header.filesystem_id,
+            root: unlocked.config.root_inode,
+            connection,
+            prefix,
+            master: unlocked.master_key,
+            names: unlocked.config.naming.clone(),
+            suite: header.protected.algorithm,
+            chunk_size,
+            parallelism,
+        }))
+    }
+    pub fn inode_name(&self, id: &[u8; 16]) -> Result<String> {
+        Ok(format!(
+            "{}{}",
+            self.prefix,
+            naming::inode(&self.names, &self.fs_id, id)?
+        ))
+    }
+    fn chunk_name(&self, config: &NamingConfig, piece: &Piece) -> Result<String> {
+        Ok(format!(
+            "{}{}",
+            self.prefix,
+            naming::chunk(config, &self.fs_id, &piece.allocation, piece.index)?
+        ))
+    }
+    pub async fn load(&self, id: [u8; 16]) -> Result<Loaded> {
+        let name = self.inode_name(&id)?;
+        let stored = self
+            .connection
+            .get(&name, inode::MAX_INODE_SIZE)
+            .await?
+            .ok_or(Error::Missing)?;
+        let object = InodeObject::decode(&stored.bytes)?;
+        let (key, body) = objects::open_inode(&self.master, &self.fs_id, &name, &id, &object)?;
+        Ok(Loaded {
+            body,
+            key: Arc::new(key),
+            suite: object.protected.algorithm,
+            etag: stored.etag,
+        })
+    }
+    async fn publish(
+        &self,
+        loaded: &Loaded,
+        body: &InodeBody,
+        expected: Option<&str>,
+    ) -> Result<String> {
+        let name = self.inode_name(&body.id)?;
+        let object = objects::seal_inode(
+            &self.master,
+            &loaded.key,
+            &self.fs_id,
+            &name,
+            &loaded.suite,
+            body,
+        )?;
+        match self
+            .connection
+            .put(&name, object.encode()?, expected)
+            .await?
+        {
+            PutResult::Applied(etag) => Ok(etag),
+            PutResult::Conflict => Err(Error::Conflict),
+        }
+    }
+    async fn create_inode(&self, id: [u8; 16], kind: u8) -> Result<Loaded> {
+        let content = if kind == inode::DIRECTORY {
+            Directory::default().encode()?
+        } else {
+            Vec::new()
+        };
+        let mut loaded = Loaded {
+            body: InodeBody {
+                id,
+                kind,
+                generation: 0,
+                content: InodeContent::Inline(content),
+                extensions: vec![],
+            },
+            key: Arc::new(SecretKey::generate()?),
+            suite: self.suite.clone(),
+            etag: String::new(),
+        };
+        loaded.etag = self.publish(&loaded, &loaded.body, None).await?;
+        Ok(loaded)
+    }
+    pub async fn list(&self, id: [u8; 16]) -> Result<Vec<Entry>> {
+        let loaded = self.load(id).await?;
+        if loaded.body.kind != inode::DIRECTORY {
+            return Err(Error::NotDirectory);
+        }
+        let InodeContent::Inline(bytes) = loaded.body.content else {
+            return Err(Error::Invalid);
+        };
+        Ok(Directory::decode(&bytes)?.entries)
+    }
+    /// Merge only directory entry edits against the latest ETag, never file contents.
+    async fn edit_directory(
+        &self,
+        parent: [u8; 16],
+        name: &str,
+        entry: Option<Entry>,
+    ) -> Result<()> {
+        for _ in 0..16 {
+            let loaded = self.load(parent).await?;
+            if loaded.body.kind != inode::DIRECTORY {
+                return Err(Error::NotDirectory);
+            }
+            let InodeContent::Inline(bytes) = &loaded.body.content else {
+                return Err(Error::Invalid);
+            };
+            let mut directory = Directory::decode(bytes)?;
+            let position = directory.entries.iter().position(|e| e.name == name);
+            match (&entry, position) {
+                (Some(_), Some(_)) => return Err(Error::Exists),
+                (Some(e), None) => directory.entries.push(e.clone()),
+                (None, Some(i)) => {
+                    directory.entries.remove(i);
+                }
+                (None, None) => return Err(Error::Missing),
+            }
+            directory.entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut body = loaded.body.clone();
+            body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
+            body.content = InodeContent::Inline(directory.encode()?);
+            match self.publish(&loaded, &body, Some(&loaded.etag)).await {
+                Ok(_) => return Ok(()),
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
+    }
+    pub async fn create(&self, parent: [u8; 16], name: &str, kind: u8) -> Result<Loaded> {
+        // Validate before creating an orphan object on invalid names.
+        Directory {
+            entries: vec![Entry {
+                name: name.into(),
+                id: [0; 16],
+                kind,
+            }],
+        }
+        .encode()?;
+        let loaded = self.create_inode(crypto::random_array()?, kind).await?;
+        self.edit_directory(
+            parent,
+            name,
+            Some(Entry {
+                name: name.into(),
+                id: loaded.body.id,
+                kind,
+            }),
+        )
+        .await?;
+        Ok(loaded)
+    }
+    pub async fn unlink(&self, parent: [u8; 16], name: &str) -> Result<()> {
+        let entries = self.list(parent).await?;
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .ok_or(Error::Missing)?;
+        // rmdir requires a stronger namespace transaction; not offered by this prototype.
+        if entry.kind == inode::DIRECTORY {
+            return Err(Error::NotDirectory);
+        }
+        self.edit_directory(parent, name, None).await
+    }
+    pub fn file(self: &Arc<Self>, loaded: Loaded, cache_dir: &Path) -> Result<FileSession> {
+        if loaded.body.kind != inode::FILE {
+            return Err(Error::NotDirectory);
+        }
+        std::fs::create_dir_all(cache_dir)?;
+        let path = cache_dir.join(format!(
+            "eedfs-{}",
+            naming::inode(&self.names, &self.fs_id, &crypto::random_array()?)?
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        std::fs::remove_file(path)?; // anonymous plaintext spool, removed automatically on process exit
+        let size = loaded.body.size()?;
+        file.set_len(size)?;
+        if let InodeContent::Inline(bytes) = &loaded.body.content {
+            file.write_all_at(bytes, 0)?;
+        }
+        Ok(FileSession {
+            volume: self.clone(),
+            base: loaded,
+            file,
+            size,
+            visible_size: size,
+            cached: BTreeSet::new(),
+            dirty: BTreeSet::new(),
+            changed: false,
+        })
+    }
+}
+
+pub struct FileSession {
+    volume: Arc<Volume>,
+    pub base: Loaded,
+    file: File,
+    pub size: u64,
+    visible_size: u64,
+    cached: BTreeSet<usize>,
+    dirty: BTreeSet<u64>,
+    changed: bool,
+}
+impl FileSession {
+    async fn ensure(&mut self, start: u64, end: u64) -> Result<()> {
+        let InodeContent::Chunks(config) = &self.base.body.content else {
+            return Ok(());
+        };
+        let naming = config.naming.clone();
+        let all = pieces(&self.base.body);
+        let selected: Vec<_> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.offset < end && p.offset + u64::from(p.len) > start)
+            .map(|(i, _)| i)
+            .collect();
+        let mut wanted = BTreeSet::new();
+        for i in selected {
+            for (j, piece) in all.iter().enumerate().skip(i).take(4) {
+                if !self.cached.contains(&j) && piece.offset < self.visible_size {
+                    wanted.insert(j);
+                }
+            }
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in wanted {
+            let piece = all[i].clone();
+            let name = self.volume.chunk_name(&naming, &piece)?;
+            let key = self.base.key.clone();
+            let suite = self.base.suite.clone();
+            let volume = self.volume.clone();
+            tasks.spawn(async move {
+                let bytes = volume
+                    .connection
+                    .get(&name, piece.len as usize + 64)
+                    .await?
+                    .ok_or(Error::Missing)?
+                    .bytes;
+                let plaintext =
+                    objects::open_chunk(&key, &volume.fs_id, &name, &suite, piece.len, &bytes)?;
+                Ok::<_, Error>((i, piece, plaintext))
+            });
+            if tasks.len() >= self.volume.parallelism {
+                self.receive_read(&mut tasks).await?;
+            }
+        }
+        while !tasks.is_empty() {
+            self.receive_read(&mut tasks).await?;
+        }
+        Ok(())
+    }
+    async fn receive_read(&mut self, tasks: &mut ReadTasks) -> Result<()> {
+        let (i, p, bytes) = tasks.join_next().await.ok_or(Error::Invalid)???;
+        let len = (self.visible_size - p.offset).min(u64::from(p.len)) as usize;
+        self.file.write_all_at(&bytes[..len], p.offset)?;
+        self.cached.insert(i);
+        Ok(())
+    }
+    pub async fn read(&mut self, offset: u64, size: usize) -> Result<Vec<u8>> {
+        let len = self.size.saturating_sub(offset).min(size as u64) as usize;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        self.ensure(offset, offset + len as u64).await?;
+        let mut bytes = vec![0; len];
+        self.file.read_exact_at(&mut bytes, offset)?;
+        Ok(bytes)
+    }
+    pub async fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(Error::TooLarge)?;
+        self.check_size(end)?;
+        self.ensure(offset, end).await?;
+        self.file.write_all_at(bytes, offset)?;
+        for index in
+            offset / self.volume.chunk_size as u64..=(end - 1) / self.volume.chunk_size as u64
+        {
+            self.dirty.insert(index);
+        }
+        self.size = self.size.max(end);
+        self.changed = true;
+        Ok(bytes.len())
+    }
+    fn check_size(&self, size: u64) -> Result<()> {
+        if size.div_ceil(self.volume.chunk_size as u64) > inode::MAX_CHUNK_REFERENCES as u64 {
+            Err(Error::TooLarge)
+        } else {
+            Ok(())
+        }
+    }
+    pub fn resize(&mut self, size: u64) -> Result<()> {
+        self.check_size(size)?;
+        if size == self.size {
+            return Ok(());
+        }
+        let from = size.min(self.size) / self.volume.chunk_size as u64;
+        for i in from..size.div_ceil(self.volume.chunk_size as u64) {
+            self.dirty.insert(i);
+        }
+        self.dirty
+            .retain(|i| *i < size.div_ceil(self.volume.chunk_size as u64));
+        self.visible_size = self.visible_size.min(size);
+        self.file.set_len(size)?;
+        self.size = size;
+        self.changed = true;
+        Ok(())
+    }
+    pub async fn commit(&mut self) -> Result<()> {
+        if !self.changed {
+            return Ok(());
+        }
+        let content = if self.size <= inode::MAX_INLINE_SIZE as u64 {
+            InodeContent::Inline(self.read(0, self.size as usize).await?)
+        } else {
+            let naming = match &self.base.body.content {
+                InodeContent::Chunks(c) => c.naming.clone(),
+                _ => NamingConfig {
+                    algorithm: naming::algorithm()?,
+                    key: crypto::random_array()?,
+                },
+            };
+            let previous = pieces(&self.base.body);
+            let allocation = crypto::random_array()?;
+            let mut next = Vec::new();
+            let mut tasks = tokio::task::JoinSet::new();
+            for index in 0..self.size.div_ceil(self.volume.chunk_size as u64) {
+                let offset = index * self.volume.chunk_size as u64;
+                let len = (self.size - offset).min(self.volume.chunk_size as u64) as u32;
+                if !self.dirty.contains(&index)
+                    && let Some(p) = previous.iter().find(|p| p.offset == offset && p.len == len)
+                {
+                    next.push(p.clone());
+                    continue;
+                }
+                let plain = self.read(offset, len as usize).await?;
+                let piece = Piece {
+                    offset,
+                    len,
+                    allocation,
+                    index,
+                };
+                let name = self.volume.chunk_name(&naming, &piece)?;
+                let volume = self.volume.clone();
+                let key = self.base.key.clone();
+                let suite = self.base.suite.clone();
+                tasks.spawn(async move {
+                    let fs = volume.fs_id;
+                    let encrypt_name = name.clone();
+                    let bytes = tokio::task::spawn_blocking(move || {
+                        objects::seal_chunk(&key, &fs, &encrypt_name, &suite, &plain)
+                    })
+                    .await??;
+                    match volume.connection.put(&name, bytes, None).await? {
+                        PutResult::Applied(_) => Ok::<_, Error>(()),
+                        PutResult::Conflict => Err(Error::Conflict),
+                    }
+                });
+                next.push(piece);
+                if tasks.len() >= self.volume.parallelism {
+                    tasks.join_next().await.ok_or(Error::Invalid)???;
+                }
+            }
+            while let Some(result) = tasks.join_next().await {
+                result??;
+            }
+            let mut runs: Vec<ChunkRun> = Vec::new();
+            for p in next {
+                if let Some(last) = runs.last_mut()
+                    && last.allocation_id == p.allocation
+                    && last.first_chunk + last.plaintext_lengths.len() as u64 == p.index
+                {
+                    last.plaintext_lengths.push(p.len);
+                    continue;
+                }
+                runs.push(ChunkRun {
+                    allocation_id: p.allocation,
+                    first_chunk: p.index,
+                    plaintext_lengths: vec![p.len],
+                });
+            }
+            InodeContent::Chunks(ChunkedContent { naming, runs })
+        };
+        let mut body = self.base.body.clone();
+        body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
+        body.content = content;
+        let etag = self
+            .volume
+            .publish(&self.base, &body, Some(&self.base.etag))
+            .await?;
+        self.base.body = body;
+        self.base.etag = etag;
+        self.visible_size = self.size;
+        self.cached.clear();
+        self.dirty.clear();
+        self.changed = false;
+        Ok(())
+    }
+}

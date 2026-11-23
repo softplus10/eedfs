@@ -1,4 +1,5 @@
 mod fs;
+mod s3fs;
 
 use std::error::Error;
 use std::os::unix::fs::MetadataExt;
@@ -20,6 +21,19 @@ struct Cli {
 enum Command {
     /// Mount the read-only development filesystem in the foreground.
     Mount { mountpoint: PathBuf },
+    /// Initialize a new encrypted volume in an unused S3 prefix.
+    Format(VolumeArgs),
+    /// Mount an encrypted S3 volume with experimental writable FUSE support.
+    MountS3 {
+        mountpoint: PathBuf,
+        #[command(flatten)]
+        volume: VolumeArgs,
+        /// Private local directory for anonymous plaintext staging files.
+        #[arg(long)]
+        cache_dir: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+    },
     /// Inspect S3 connectivity without modifying the bucket.
     S3 {
         #[command(subcommand)]
@@ -51,10 +65,118 @@ struct S3Args {
     timeout_seconds: u64,
 }
 
+#[derive(Args)]
+struct VolumeArgs {
+    #[command(flatten)]
+    s3: S3Args,
+    #[arg(long, default_value = "eedfs/")]
+    prefix: String,
+    /// Password bytes; a single trailing LF (and optional CR) is removed.
+    #[arg(long, env = "EEDFS_PASSWORD_FILE")]
+    password_file: PathBuf,
+    /// Writer policy, not a persisted per-file maximum.
+    #[arg(long, default_value_t=8*1024*1024)]
+    chunk_size: usize,
+    #[arg(long, default_value_t = 8)]
+    parallelism: usize,
+    /// Test/development setup only: explicitly create a missing bucket at format.
+    #[arg(long)]
+    create_bucket: bool,
+}
+fn connection(args: S3Args) -> Result<Connection, ConnectionError> {
+    Connection::new(ConnectionConfig {
+        bucket: args.bucket,
+        region: args.region,
+        endpoint_url: args.endpoint_url,
+        force_path_style: args.force_path_style,
+        timeout: Duration::from_secs(args.timeout_seconds),
+    })
+}
+fn password(path: &std::path::Path) -> Result<zeroize::Zeroizing<Vec<u8>>, ConnectionError> {
+    let mut p = zeroize::Zeroizing::new(std::fs::read(path)?);
+    if p.last() == Some(&b'\n') {
+        p.pop();
+        if p.last() == Some(&b'\r') {
+            p.pop();
+        }
+    }
+    if p.is_empty() {
+        return Err("password file is empty".into());
+    }
+    Ok(p)
+}
 fn main() -> Result<(), ConnectionError> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     match Cli::parse().command {
         Command::Mount { mountpoint } => mount(mountpoint),
+        Command::Format(args) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let password = password(&args.password_file)?;
+            let c = connection(args.s3)?;
+            runtime.block_on(async {
+                if args.create_bucket {
+                    c.create_bucket().await?;
+                }
+                eedfs::volume::Volume::format(
+                    c,
+                    args.prefix,
+                    &password,
+                    args.chunk_size,
+                    args.parallelism,
+                )
+                .await?;
+                Ok::<_, ConnectionError>(())
+            })?;
+            println!("Encrypted S3 volume initialized");
+            Ok(())
+        }
+        Command::MountS3 {
+            mountpoint,
+            volume: args,
+            cache_dir,
+            threads,
+        } => {
+            if threads == 0 || threads > 64 {
+                return Err("threads must be 1..64".into());
+            }
+            if args.create_bucket {
+                return Err("--create-bucket is only valid with format".into());
+            }
+            let mountpoint = mountpoint.canonicalize()?;
+            if !mountpoint.is_dir() || std::fs::read_dir(&mountpoint)?.next().is_some() {
+                return Err("mountpoint must be an existing empty directory".into());
+            }
+            std::fs::create_dir_all(&cache_dir)?;
+            let cache = cache_dir.canonicalize()?;
+            if cache.starts_with(&mountpoint) {
+                return Err("cache directory must be outside mountpoint".into());
+            }
+            let metadata = mountpoint.metadata()?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let volume = runtime.block_on(eedfs::volume::Volume::open(
+                connection(args.s3)?,
+                args.prefix,
+                &password(&args.password_file)?,
+                args.chunk_size,
+                args.parallelism,
+            ))?;
+            let mut config = Config::default();
+            config.n_threads = Some(threads);
+            config.mount_options = vec![
+                MountOption::FSName("eedfs-s3".into()),
+                MountOption::Subtype("eedfs".into()),
+                MountOption::RW,
+                MountOption::DefaultPermissions,
+                MountOption::NoDev,
+                MountOption::NoSuid,
+            ];
+            fuser::mount(
+                s3fs::S3Filesystem::new(volume, runtime, cache, metadata.uid(), metadata.gid()),
+                mountpoint,
+                &config,
+            )?;
+            Ok(())
+        }
         Command::S3 {
             command: S3Command::Check(args),
         } => {

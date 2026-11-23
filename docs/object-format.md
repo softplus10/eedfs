@@ -2,8 +2,9 @@
 
 Experimental; inode v1/v2 are rejected. Inode v3 removes the stored per-file
 chunk-size cap. Header is independently versioned at v4.
-Code lives in `src/format/{header,inode,data_chunk}.rs`. No directory entry format,
-POSIX metadata, S3 object publication, or filesystem transaction is implemented.
+Code lives in `src/format/{header,inode,data_chunk}.rs`. The experimental
+[S3/FUSE layer](s3-fuse.md) implements inline directory entries and conditional
+object publication. POSIX metadata and multi-object transactions remain deferred.
 
 ## Inode envelope
 
@@ -44,7 +45,7 @@ ChunkRun {
 ```
 
 Postcard enum tags are fixed: Inline=0, Chunks=1. Kind: file=1, directory=2;
-directory payload encoding remains undecided. Runs concatenate in vector order.
+directory payload encoding is specified in the [S3/FUSE guide](s3-fuse.md). Runs concatenate in vector order.
 A run's count is its length-vector size. Prefix sums map variable-size chunks to
 file offsets. File size is computed, not duplicated. Empty files use Inline([]).
 COW updates split/reuse old runs and allocate new IDs for new runs. Naming inputs
@@ -99,4 +100,5 @@ entire old, valid inode/header. Generation alone does not solve rollback.
 Future storage integration must upload new chunks create-only (`If-None-Match:*`)
 then publish the inode with ETag `If-Match`. On conflict, rebase/merge while
 retaining staged chunks. Raw S3 ETags are concurrency tokens, not AEAD integrity
-checks. No conditional-write/retry/GC pipeline exists in the current FUSE scaffold.
+checks. The S3/FUSE prototype implements conditional publication and parent-directory
+CAS retry. Same-file merge, crash recovery and GC remain future work.

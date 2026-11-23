@@ -1,4 +1,4 @@
-//! S3 client configuration and a read-only bucket connectivity check.
+//! Pooled S3 client, bounded object reads and conditional object publication.
 
 use std::error::Error;
 use std::time::Duration;
@@ -100,5 +100,102 @@ fn s3_credentials() -> Result<Credentials, ConnectionError> {
             "set both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY; S3_SESSION_TOKEN is optional"
                 .into(),
         ),
+    }
+}
+
+/// Conditional publication result. A conflict is distinct from a transport error.
+#[derive(Debug)]
+pub enum PutResult {
+    Applied(String),
+    Conflict,
+}
+pub struct StoredObject {
+    pub bytes: Vec<u8>,
+    pub etag: String,
+}
+impl Connection {
+    /// Explicit setup helper; normal format/mount operations never create buckets.
+    pub async fn create_bucket(&self) -> Result<(), ConnectionError> {
+        self.client
+            .create_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await?;
+        Ok(())
+    }
+    pub async fn get(
+        &self,
+        key: &str,
+        limit: usize,
+    ) -> Result<Option<StoredObject>, ConnectionError> {
+        let mut response = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if e.as_service_error().is_some_and(|s| s.is_no_such_key()) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if response
+            .content_length()
+            .is_some_and(|n| n < 0 || n as u64 > limit as u64)
+        {
+            return Err("S3 object exceeds read limit".into());
+        }
+        let etag = response.e_tag().ok_or("S3 response lacks ETag")?.to_owned();
+        let mut bytes = Vec::new();
+        while let Some(part) = response.body.try_next().await? {
+            if part.len() > limit.saturating_sub(bytes.len()) {
+                return Err("S3 object exceeds read limit".into());
+            }
+            bytes.extend_from_slice(&part);
+        }
+        Ok(Some(StoredObject { bytes, etag }))
+    }
+    /// None means create-only; Some(etag) means replace that exact version.
+    /// Exact-byte readback resolves a retry that reached S3 before losing its reply.
+    pub async fn put(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        expected: Option<&str>,
+    ) -> Result<PutResult, ConnectionError> {
+        let bytes = bytes::Bytes::from(bytes);
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type("application/octet-stream")
+            .body(aws_sdk_s3::primitives::ByteStream::from(bytes.clone()));
+        request = match expected {
+            Some(etag) => request.if_match(etag),
+            None => request.if_none_match("*"),
+        };
+        match request.send().await {
+            Ok(r) => Ok(PutResult::Applied(
+                r.e_tag().ok_or("S3 PUT response lacks ETag")?.to_owned(),
+            )),
+            Err(e) => {
+                let conflict = e
+                    .raw_response()
+                    .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412));
+                // A matching readback is safe even when the original result was ambiguous.
+                if let Ok(Some(current)) = self.get(key, bytes.len()).await
+                    && current.bytes.as_slice() == bytes.as_ref()
+                {
+                    return Ok(PutResult::Applied(current.etag));
+                }
+                if conflict {
+                    Ok(PutResult::Conflict)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 }

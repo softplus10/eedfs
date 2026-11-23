@@ -75,7 +75,8 @@ reassembly, metadata/AAD/ciphertext tampering and resource rejection for both AE
 No security claim follows from round-trip tests alone.
 
 No password rotation UI, key revocation, authenticated sharing grant, rollback
-protection, directory transactions, safe GC, or S3/FUSE encryption pipeline yet.
+protection, multi-object directory transactions or safe GC yet. The experimental
+[S3/FUSE pipeline](s3-fuse.md) now uses these helpers for object storage.
 Password/KEK changes can rewrap the master key without rewriting file chunks.
 Changing an inode's body/chunk encryption profile requires rewriting chunks that
 remain referenced. Public algorithm descriptors must be authenticated through AAD.

@@ -1,0 +1,48 @@
+name: S3 and FUSE integration
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  minio:
+    runs-on: ubuntu-latest
+    env:
+      S3_ACCESS_KEY_ID: eedfs-integration
+      S3_SECRET_ACCESS_KEY: disposable-loopback-test-only
+      S3_ENDPOINT_URL: http://127.0.0.1:19000
+      S3_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: 'true'
+      S3_BUCKET: eedfs-integration
+      MINIO_ROOT_USER: eedfs-integration
+      MINIO_ROOT_PASSWORD: disposable-loopback-test-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - name: Build pinned MinIO source
+        run: go install github.com/minio/minio@RELEASE.2025-04-22T22-12-26Z
+      - name: Start loopback MinIO
+        run: |
+          mkdir -p "$RUNNER_TEMP/minio-data"
+          "$(go env GOPATH)/bin/minio" server "$RUNNER_TEMP/minio-data" --address 127.0.0.1:19000 --console-address 127.0.0.1:19001 > "$RUNNER_TEMP/minio.log" 2>&1 &
+          for attempt in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:19000/minio/health/ready; then exit 0; fi
+            sleep 0.2
+          done
+          cat "$RUNNER_TEMP/minio.log"
+          exit 1
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: cargo build --locked
+      - name: Initialize disposable bucket
+        run: |
+          printf 'integration password\n' > "$RUNNER_TEMP/password"
+          chmod 600 "$RUNNER_TEMP/password"
+          target/debug/eedfs format --password-file "$RUNNER_TEMP/password" --prefix setup/ --create-bucket
+      - run: cargo test --locked --test volume_minio -- --ignored --test-threads=1
+      - name: Three mounted clients
+        run: |
+          sudo modprobe fuse
+          python3 scripts/bench-s3-fuse.py --binary target/debug/eedfs --password-file "$RUNNER_TEMP/password" --work-dir "$RUNNER_TEMP/fuse-test" --output "$RUNNER_TEMP/result.json"
