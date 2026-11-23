@@ -140,7 +140,8 @@ CSV on stdout, metadata sizes on stderr. Three samples per case by default;
 `--mib-per-sample` controls the logical input size (default 64 MiB). Cases cover
 4 KiB, 64 KiB, 1 MiB and 8 MiB chunks, raw in-place AEAD, complete chunk seal/open,
 three-worker aggregate encryption, inode serialization, and password KDF latency.
-The optional 10 GiB stream retains one chunk at a time; it performs no network or
+The [recorded benchmark](docs/benchmarks/crypto-2026-11-24.md) includes raw CSV
+and environment details. The optional 10 GiB stream retains one chunk at a time; it performs no network or
 disk I/O. Results measure CPU/allocation costs, not NAS throughput.
 
 ## Design direction
