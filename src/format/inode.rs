@@ -1,18 +1,18 @@
-//! Inode envelope and minimal inline/chunk-reference body. No filesystem operations.
+//! Inode envelope and minimal inline/chunk-run body. No filesystem operations.
 
 use super::{
     codec,
     common::{MAX_METADATA_SIZE, object_aad, validate_extensions},
-    header::{Extension, FormatError, MAX_EXTENSIONS, SealedRegion},
+    header::{Extension, FormatError, MAX_EXTENSIONS, NamingConfig, SealedRegion},
 };
 use codec::bounded;
 use serde::{Deserialize, Serialize};
 type Result<T> = std::result::Result<T, FormatError>;
-use super::data_chunk::{DataChunkObject, MAX_CHUNK_PLAINTEXT};
-use codec::{bounded_bytes, object_key, serialize_bytes};
+use super::data_chunk::MAX_CHUNK_PLAINTEXT;
+use codec::{bounded_bytes, serialize_bytes};
 use std::fmt;
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const FILE: u8 = 1;
 pub const DIRECTORY: u8 = 2;
 pub const MAX_INLINE_SIZE: usize = 64 * 1024;
@@ -53,7 +53,7 @@ impl fmt::Debug for InodeBody {
     }
 }
 
-/// Persisted enum tags are fixed by schema v1: Inline=0, Chunks=1.
+/// Persisted enum tags are fixed by schema v2: Inline=0, Chunks=1.
 /// Reordering/inserting variants is a format change, not an implementation detail.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InodeContent {
@@ -64,9 +64,7 @@ pub enum InodeContent {
         )]
         Vec<u8>,
     ),
-    Chunks(
-        #[serde(deserialize_with = "bounded::<_, _, MAX_CHUNK_REFERENCES>")] Vec<ChunkReference>,
-    ),
+    Chunks(ChunkedContent),
 }
 impl fmt::Debug for InodeContent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,40 +72,65 @@ impl fmt::Debug for InodeContent {
             Self::Inline(bytes) => f.debug_struct("Inline").field("len", &bytes.len()).finish(),
             Self::Chunks(chunks) => f
                 .debug_struct("Chunks")
-                .field("count", &chunks.len())
+                .field("run_count", &chunks.runs.len())
                 .finish(),
         }
     }
 }
 
-/// References are concatenated in list order. Object names are explicit so a
-/// recipient does not need the filesystem-wide secret naming key.
+/// Per-file settings are encrypted inside the inode. Encryption settings are
+/// shared with the inode envelope and are deliberately not repeated here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChunkReference {
-    #[serde(deserialize_with = "object_key")]
-    pub object_key: String,
-    pub plaintext_len: u64,
+pub struct ChunkedContent {
+    pub naming: NamingConfig,
+    pub max_chunk_size: u32,
+    #[serde(deserialize_with = "bounded::<_, _, MAX_CHUNK_REFERENCES>")]
+    pub runs: Vec<ChunkRun>,
 }
-impl ChunkReference {
-    fn validate(&self) -> Result<()> {
-        codec::validate_object_key(&self.object_key)?;
-        if self.plaintext_len == 0 || self.plaintext_len > MAX_CHUNK_PLAINTEXT as u64 {
-            return Err(FormatError::Invalid("chunk plaintext length"));
+
+/// Fresh allocation ID per newly written run. COW edits split/reuse old runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkRun {
+    pub allocation_id: [u8; 16],
+    pub first_chunk: u64,
+    #[serde(deserialize_with = "bounded::<_, _, MAX_CHUNK_REFERENCES>")]
+    pub plaintext_lengths: Vec<u32>,
+}
+impl ChunkedContent {
+    pub fn size(&self) -> Result<u64> {
+        self.naming.algorithm.validate()?;
+        if self.max_chunk_size == 0
+            || self.max_chunk_size as usize > MAX_CHUNK_PLAINTEXT
+            || self.runs.is_empty()
+            || self.runs.len() > MAX_CHUNK_REFERENCES
+        {
+            return Err(FormatError::Invalid("chunk configuration"));
         }
-        Ok(())
-    }
-    /// Build the chunk's authentication context using this reference's exact S3 key.
-    pub fn aad(&self, filesystem_id: &[u8; 16], chunk: &DataChunkObject) -> Result<Vec<u8>> {
-        self.validate()?;
-        chunk.aad(filesystem_id, &self.object_key)
-    }
-    /// Check after AEAD verification and decryption of the referenced chunk.
-    pub fn validate_plaintext(&self, plaintext: &[u8]) -> Result<()> {
-        self.validate()?;
-        if plaintext.len() as u64 != self.plaintext_len {
-            return Err(FormatError::Invalid("chunk plaintext length mismatch"));
+        let mut count = 0usize;
+        let mut size = 0u64;
+        for run in &self.runs {
+            if run.plaintext_lengths.is_empty() {
+                return Err(FormatError::Invalid("empty chunk run"));
+            }
+            run.first_chunk
+                .checked_add(run.plaintext_lengths.len() as u64 - 1)
+                .ok_or(FormatError::Invalid("chunk index overflow"))?;
+            count = count
+                .checked_add(run.plaintext_lengths.len())
+                .ok_or(FormatError::TooLarge)?;
+            if count > MAX_CHUNK_REFERENCES {
+                return Err(FormatError::TooLarge);
+            }
+            for &len in &run.plaintext_lengths {
+                if len == 0 || len > self.max_chunk_size {
+                    return Err(FormatError::Invalid("chunk plaintext length"));
+                }
+                size = size
+                    .checked_add(u64::from(len))
+                    .ok_or(FormatError::TooLarge)?;
+            }
         }
-        Ok(())
+        Ok(size)
     }
 }
 impl InodeContent {
@@ -119,16 +142,7 @@ impl InodeContent {
                 }
                 Ok(bytes.len() as u64)
             }
-            Self::Chunks(chunks) => {
-                if chunks.is_empty() || chunks.len() > MAX_CHUNK_REFERENCES {
-                    return Err(FormatError::Invalid("chunk reference count"));
-                }
-                chunks.iter().try_fold(0_u64, |size, chunk| {
-                    chunk.validate()?;
-                    size.checked_add(chunk.plaintext_len)
-                        .ok_or(FormatError::TooLarge)
-                })
-            }
+            Self::Chunks(chunks) => chunks.size(),
         }
     }
 }

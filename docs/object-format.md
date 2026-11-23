@@ -1,241 +1,100 @@
-# Inode and data-chunk object formats, version 1
+# Inode and data-chunk format v2
 
-These codecs specify stored envelopes and a minimal inode body.
-Implementation modules are `src/format/header.rs`, `inode.rs`, and
-`data_chunk.rs`; `codec.rs` and `common.rs` contain shared internal helpers.
-A directory-entry schema/module remains deferred. They use the
-same Serde/Postcard encoding, canonical decoding, extension rules, and bounded
-allocation helpers as the header. The header remains byte-compatible v3; object
-versions are independent. No encryption, key derivation, HMAC naming, S3 object
-GET/PUT, FUSE file operations, or garbage collection is implemented here.
+Experimental; incompatible with v1. Header is independently versioned at v4.
+Code lives in `src/format/{header,inode,data_chunk}.rs`. No directory entry format,
+POSIX metadata, S3 object publication, or filesystem transaction is implemented.
 
-## Framing
+## Inode envelope
 
-Every container has a 16-byte prefix:
+`EEDFSINO` + the 16-byte framing convention in [header format](header-format.md),
+version 2, followed by canonical Postcard:
 
-```text
-magic[8] | version:u16 LE (=1) | flags:u16 LE (=0) | payload_len:u32 LE
-Postcard payload, in the field order shown below
 ```
-
-Magic values are `EEDFSINO` for stored inode envelopes, `EEDFSINB` for plaintext
-inode bodies, and `EEDFSCHK` for stored data-chunk envelopes. The inode body is
-encoded only as input to encryption; it is not uploaded as a separate object.
-Exact lengths, canonical Postcard encoding, type magic, and version are enforced.
-
-## Stored inode envelope
-
-```text
 InodeObject {
-    wrapped_inode_key: SealedRegion,
-    protected: SealedRegion,
-    extensions: Vec<Extension>,
+  wrapped_inode_key: SealedRegion,
+  protected: SealedRegion,          // profile shared by inode body AND its chunks
+  extensions: Vec<Extension>,
 }
-SealedRegion {
-    algorithm: Algorithm,
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>, // appended authentication tag included
-}
-Algorithm { id:u16, parameters:Vec<u8> }
-Extension { kind:u16, required:bool, value:Vec<u8> }
 ```
 
-The master-key-derived wrapping key will unwrap a per-inode key. Separate
-purpose-derived keys from that inode key will protect the inode body and its
-data chunks. Key generation, derivation labels, actual cryptographic algorithms,
-and suite-specific checks remain future crypto-layer work. Both sealed regions
-have independent nonces and tags, and each envelope identifies its algorithm
-rather than relying on mutable header defaults.
+The random 32-byte inode key is wrapped using a master-key-derived wrapping key.
+Distinct body and chunk keys are derived from that inode key using HKDF. Wrapping
+and body profiles are independently described by the envelope. Creation currently
+uses the selected AEAD for both. Both supported AEADs are allowed for wrapping.
 
-The stable inode object key is the inode's publication point. Later writers can
-upload immutable chunks and conditionally replace the inode with `If-Match`.
-New chunks must use create-only PUT (`If-None-Match: *`) to preserve immutability.
-The codec does not perform this transaction or retries.
+Decrypted body has its own `EEDFSINB` frame, version 2:
 
-## Minimal plaintext inode
-
-```text
+```
 InodeBody {
-    id: [u8;16],
-    kind: u8,           // 1=file, 2=directory
-    generation: u64,
-    content: InodeContent,
-    extensions: Vec<Extension>,
+  id: [u8;16], kind:u8, generation:u64,
+  content: InodeContent,
+  extensions: Vec<Extension>,
 }
-InodeContent =
-    Inline(Vec<u8>)             // fixed Postcard variant tag 0
-  | Chunks(Vec<ChunkReference>) // fixed Postcard variant tag 1
-
-ChunkReference {
-    object_key: String,
-    plaintext_len: u64,
+InodeContent = Inline(Vec<u8>) | Chunks(ChunkedContent)
+ChunkedContent {
+  naming: NamingConfig,             // per-file secret, not the global naming key
+  max_chunk_size:u32,
+  runs: Vec<ChunkRun>,
 }
-```
-
-Only inline data and a flat ordered list of whole-chunk references are included.
-There are no POSIX ownership/mode/timestamps, directory-entry schema, share-name
-field, extent offsets/slices, sparse ranges, tree indexes, snapshots, reflinks,
-or per-chunk key records. These require further design rather than speculative
-fields in this initial format. Directory content is opaque bytes at this stage;
-kind 2 does not mean directory operations are implemented.
-
-Postcard encodes structs in field order with no field names/count. The content
-variant tags **0 and 1 are part of the v1 schema**: declaration reordering or
-inserting a variant is not allowed without format evolution. Other integers use
-Postcard unsigned varints; fixed byte arrays are raw bytes. Inline/chunk byte
-blobs use Serde's bulk-byte API, preserving the same Postcard representation as
-`Vec<u8>` while avoiding per-byte operations for large ciphertexts.
-
-Size is derived, not separately persisted: inline byte length or the checked sum
-of referenced plaintext lengths. Chunk references concatenate in list order,
-with no gaps or overlaps to describe. Empty files use `Inline([])`; an empty
-chunk list or zero-length chunk reference is rejected. Repeated references to the
-same immutable object are permitted.
-
-Each reference stores the **actual S3 object key**, so a file-sharing recipient
-need not receive the filesystem-wide naming key. The future naming module can
-compute keys from allocation IDs/chunk numbers; this reference format does not
-require recomputing names or deriving identity from them.
-
-## Data chunk envelope and reference linkage
-
-```text
-DataChunkObject {
-    protected: SealedRegion<MAX_CHUNK_CIPHERTEXT>,
-    extensions: Vec<Extension>,
+ChunkRun {
+  allocation_id:[u8;16],            // fresh per newly allocated chunk run
+  first_chunk:u64,
+  plaintext_lengths:Vec<u32>,
 }
 ```
 
-The const-generic SealedRegion limit affects resource validation, not wire fields.
-Header/inode metadata retain their 1 MiB ciphertext budget; chunk ciphertext can
-exceed that budget, including the 8 MiB sizes discussed during design.
-The decrypted chunk payload is raw bytes: it has no extra container or inode data.
+Postcard enum tags are fixed: Inline=0, Chunks=1. Kind: file=1, directory=2;
+directory payload encoding remains undecided. Runs concatenate in vector order.
+A run's count is its length-vector size. Prefix sums map variable-size chunks to
+file offsets. File size is computed, not duplicated. Empty files use Inline([]).
+COW updates split/reuse old runs and allocate new IDs for new runs. Naming inputs
+are allocation ID plus chunk number, not file offset or inode generation.
 
-A future read path will:
+Limits: inode frame <=1 MiB; inline <=64 KiB; at most 4096 total chunk references
+and 4096 runs; each run nonempty, chunk lengths 1..=max_chunk_size, maximum <=64 MiB.
+Index addition and size sums are checked. The current flat list therefore has a
+scalability ceiling; a larger index is future work. Object extensions have at most
+4096 bytes each and otherwise follow the header extension rules.
 
-1. Authenticate/decrypt the inode, then decode `InodeBody`.
-2. For `Inline`, use those bytes directly. For `Chunks`, fetch each listed key.
-3. Decode `DataChunkObject` and build its AAD with `ChunkReference::aad`.
-4. Authenticate/decrypt with the file's chunk-data key and the stored nonce.
-5. Call `ChunkReference::validate_plaintext` on the verified plaintext, then
-   concatenate in reference order.
+## Compact data chunks
 
-The helper checks exact length, not cryptographic authenticity: AEAD verification
-must precede use of the plaintext. The tests use already-known plaintext fixtures,
-not a fake encryption implementation or a live S3 service.
+```
+nonce | ciphertext | tag
+```
 
-Logical overwrite can replace an affected whole chunk with a new immutable object
-and publish an updated reference list. Inline-to-chunks and chunks-to-inline
-transitions preserve inode ID and change only content/generation. This supports
-a future COW publication protocol, not a completed COW filesystem. Old data is
-not deleted automatically; reader-safe reclamation remains separate work.
+There is **no magic, frame, version, algorithm descriptor, or extension array in
+chunk bytes**. The authenticated inode envelope supplies the suite, and its body
+supplies the expected plaintext length. This context is mandatory for parsing.
+XChaCha20-Poly1305 overhead is 24+16=40 bytes, AES-256-GCM-SIV overhead is 12+16=28.
+Chunks are borrowed slices when parsed; authentication produces owned plaintext.
+
+All chunks referenced by an inode use its common encryption profile. Changing
+that profile requires rewriting the referenced chunks. Each encryption uses a
+fresh OS-generated nonce. Nonce/tag bytes are per object; profile parameters are
+fixed per inode. Shared recipients need the inode location, inode key, filesystem
+ID and expected inode ID; the encrypted inode gives them chunk naming information.
+No sharing service or grant serialization is implemented.
 
 ## Authentication context
 
-Context values must come from the caller's trusted header/reference and the exact
-S3 key used for access, not solely from unauthenticated object fields. Root inodes
-need no public inode ID: the header already supplies their authenticated object
-location. After decryption, the body ID should also match a directory reference
-when one is available.
+AAD is raw domain then canonical Postcard tuple. Version is u16; expected chunk
+plaintext length is u32. `metadata` in these contexts excludes the region's own
+ciphertext. Every context binds the trusted filesystem ID and exact S3 key.
 
-Each AAD consists of a raw domain label including its trailing zero byte followed
-by this Postcard tuple. No discovery prefix is part of AAD.
+- `EEDFS/inode-key\0`: `(2, fs_id, object_key,
+  (wrapping_algorithm, wrapping_nonce, extensions))`.
+- `EEDFS/inode-body\0`: `(2, fs_id, object_key,
+  (full_wrapped_key_region, body_algorithm, body_nonce, extensions))`.
+- `EEDFS/data-chunk\0`: `(2, fs_id, object_key,
+  (common_algorithm, chunk_nonce, expected_plaintext_length))`.
 
-```text
-inode key wrapping:
-"EEDFS/inode-key\0" || Postcard((
-    VERSION, filesystem_id, object_key,
-    (wrapping_algorithm, wrapping_nonce, inode_extensions)
-))
+Chunk AAD excludes logical file offset/generation to allow immutable reuse.
+AEAD prevents swapping locations or metadata, but does not prevent replay of an
+entire old, valid inode/header. Generation alone does not solve rollback.
 
-inode body:
-"EEDFS/inode-body\0" || Postcard((
-    VERSION, filesystem_id, object_key,
-    (wrapped_inode_key, body_algorithm, body_nonce, inode_extensions)
-))
+## Publication boundary
 
-data chunk:
-"EEDFS/data-chunk\0" || Postcard((
-    VERSION, filesystem_id, object_key,
-    (chunk_algorithm, chunk_nonce, chunk_extensions)
-))
-```
-
-VERSION is u16; filesystem_id is 16 bytes; object_key is a UTF-8 string. Domain
-separation prevents cross-type use. The wrapped key's ciphertext is excluded
-from its own AAD, but included in the body's AAD. Body/chunk ciphertext is already
-authenticated by AEAD and excluded from its own AAD. Pre-encryption AAD construction
-permits the corresponding ciphertext field to be empty.
-
-Chunk AAD deliberately excludes current file offset and inode generation, allowing
-an immutable object to remain valid when referenced at a different offset. No
-storage naming key is needed to build AAD. Updating an inode's wrapped key or its
-extensions changes the body's AAD and therefore requires fresh body authentication.
-AEAD alone does not prevent replay of an old valid object; generation is not a
-trusted monotonic counter or a replacement for ETag concurrency control.
-
-## Initial limits and validation
-
-| Item | Limit |
-| --- | --- |
-| Inode envelope / encoded inode body | 1 MiB |
-| Inline content | 64 KiB |
-| Flat chunk reference list | 4096 entries |
-| Each chunk's plaintext length in a reference | 1 byte–64 MiB |
-| Chunk ciphertext | 64 MiB + 64 bytes tag allowance |
-| Complete chunk envelope | 65 MiB |
-| Nonce / algorithm parameters | 64 bytes / 4096 bytes |
-| Each object extension value | 4096 bytes |
-| Extensions per container | 64 |
-| S3 object key | 1–1024 UTF-8 bytes |
-
-These are initial format/resource caps, not writer chunk-size/inline policies.
-The flat list cannot describe arbitrarily large/fragmented files; an index format
-is intentionally deferred. Algorithm implementations must enforce actual nonce,
-key and tag lengths and verify that decrypted payloads fit their references.
-
-Bytes are borrowed from input and length-checked before being copied; sequence
-counts are checked before allocations. Encoder size measurement occurs before
-output allocation. Unknown optional extensions survive re-encoding; unknown
-required ones, duplicate/out-of-order extension IDs, unknown inode kinds/content
-tags, malformed lengths, trailing bytes and noncanonical encodings are rejected.
-`InodeBody`/`InodeContent` debug output reports lengths/counts rather than file
-contents. Plaintext body buffers still require future secret-lifetime management.
-
-## Candidate simplification: variable-sized chunk runs (not implemented)
-
-The current implementation stores `object_key + plaintext_len` per chunk and
-allows variable chunk sizes up to the format cap. A maximum size is **not** a
-fixed chunk size: chunk numbers/counts alone do not locate byte boundaries.
-The following is a proposed next schema, not the current v1 wire format:
-
-```text
-ChunkRun {
-    allocation_id: [u8;16],
-    first_chunk: u64,
-    plaintext_lengths: Vec<u32>,
-}
-```
-
-The count is the length-vector length, and object names could be computed from
-the allocation ID and `first_chunk + local_index`. Prefix sums locate logical
-byte offsets. A write replacing one chunk could split an old run into a prefix,
-a fresh-allocation run, and an old suffix. This would preserve COW without
-repeating complete names, while still retaining variable-length boundaries.
-
-A naming rule must first be agreed: the existing explicit-name references let a
-sharing recipient read chunks without the filesystem-wide naming key. Compact
-references must preserve that property. One candidate is deriving a per-inode
-chunk-naming key from the per-inode key, using the protected filesystem naming
-key only for inode names. That changes the naming contract and is not implemented
-or assigned a scheme ID here.
-
-The header already contains `ProtectedConfig.data_encryption` as a default;
-current chunks also store an explicit Algorithm. A raw `nonce || ciphertext+tag`
-chunk encoding could remove that duplication if the caller supplies an
-authenticated suite/layout. The suite defines nonce/tag sizes. Such a schema
-must make its encryption profile immutable for existing chunks, or introduce
-versioned profiles referenced by inode/run metadata; changing a header default
-must never silently change the interpretation of existing chunks. Sharing must
-also convey the relevant authenticated crypto profile. Raw chunk encoding and
-profile evolution remain design proposals, not changes in this refactor.
+Future storage integration must upload new chunks create-only (`If-None-Match:*`)
+then publish the inode with ETag `If-Match`. On conflict, rebase/merge while
+retaining staged chunks. Raw S3 ETags are concurrency tokens, not AEAD integrity
+checks. No conditional-write/retry/GC pipeline exists in the current FUSE scaffold.

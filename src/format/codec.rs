@@ -137,19 +137,3 @@ pub(super) fn validate_object_key(key: &str) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn object_key<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<String, D::Error> {
-    struct ObjectKey;
-    impl Visitor<'_> for ObjectKey {
-        type Value = String;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a 1-1024 byte UTF-8 object key")
-        }
-        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<String, E> {
-            validate_object_key(value).map_err(E::custom)?;
-            Ok(value.to_owned())
-        }
-    }
-    deserializer.deserialize_str(ObjectKey)
-}

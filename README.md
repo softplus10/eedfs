@@ -4,8 +4,9 @@ End-to-end encrypted distributed filesystem. **Early development.**
 
 EEDFS is a Rust/FUSE filesystem targeting shared, S3-compatible object storage.
 The current implementation is a read-only FUSE scaffold exposing `README.txt`.
-An S3 connection check is also available. Object storage operations, encryption,
-persistence, and distributed concurrency control are not implemented yet.
+An S3 connection check, binary object formats, and in-memory authenticated
+encryption helpers are also available. S3 object reads/writes, persistence, and
+distributed concurrency control are not implemented yet.
 
 ## Development environment
 
@@ -112,31 +113,35 @@ incomplete credentials and the absence of an AWS credential fallback. This check
 connectivity only, not full S3 API or conditional-write support. Real-provider
 compatibility requires running `s3 check` with that provider's endpoint and credentials.
 
-## Binary header format
+## Object formats and encryption
 
-The [Serde/Postcard header codec and format specification](docs/header-format.md)
-cover versioned keyslots, algorithm-specific typed parameter payloads, encrypted
-configuration envelopes, canonical AEAD associated-data inputs, and preserved
-optional extensions. The v3 protected payload contains the root inode object key,
-default inode/data encryption descriptors, and a naming-scheme descriptor with its own 32-byte
-secret key. The root inode will carry its own wrapped inode key.
+- [Header v4](docs/header-format.md): password keyslots, protected root inode ID
+  and filesystem-wide inode naming configuration.
+- [Inode/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
+  encryption profile, inline data or variable-size chunk runs. Chunk bytes contain
+  only nonce and ciphertext/tag; names derive from allocation ID and chunk index.
+- [Crypto profiles and key hierarchy](docs/crypto.md): XChaCha20-Poly1305,
+  AES-256-GCM-SIV, Argon2id, HKDF-SHA256, HMAC-SHA256; explicit stable algorithm IDs.
 
-This is serialization only: it does not implement encryption, unlock, or header
-creation/upload. Algorithm-specific cryptographic implementations remain separate work.
+`crypto::objects` creates/unlocks headers, seals/opens inode objects, and seals/opens
+chunks in memory, including shared access using a separately granted inode key.
+All of this remains independent of the read-only FUSE scaffold and S3 connectivity
+check. Old experimental formats are incompatible and rejected. Directory entries,
+POSIX attributes, encryption key lifecycle workflows and filesystem writes remain
+future work. The cryptographic integration has not received a security audit.
 
-## Inode and chunk formats
+## Local crypto benchmark
 
-The [object format codecs](docs/object-format.md), split into `header.rs`,
-`inode.rs`, and `data_chunk.rs` under `src/format/`, define an inode envelope with a
-wrapped per-inode key and encrypted body, plus an immutable data-chunk envelope.
-The minimal inode body contains an ID, kind, generation, and either inline bytes
-or an ordered list of S3 chunk keys/plaintext lengths. Reference helpers construct
-chunk authentication context and check decrypted lengths. Extent trees, POSIX
-attributes, directory-entry encoding, and filesystem operations remain deferred.
+```sh
+cargo run --release --locked --example crypto_bench -- --ten-gib
+```
 
-These codecs do not connect the FUSE scaffold to S3 or implement encryption or
-S3 object reads/writes. Tests exercise serialized inode/chunk linkage with local
-fixtures, including 8 MiB chunk envelopes, rather than cloud storage or crypto.
+CSV on stdout, metadata sizes on stderr. Three samples per case by default;
+`--mib-per-sample` controls the logical input size (default 64 MiB). Cases cover
+4 KiB, 64 KiB, 1 MiB and 8 MiB chunks, raw in-place AEAD, complete chunk seal/open,
+three-worker aggregate encryption, inode serialization, and password KDF latency.
+The optional 10 GiB stream retains one chunk at a time; it performs no network or
+disk I/O. Results measure CPU/allocation costs, not NAS throughput.
 
 ## Design direction
 
@@ -146,7 +151,7 @@ fixtures, including 8 MiB chunk envelopes, rather than cloud storage or crypto.
 - Metadata conflict detection, merge, and retry.
 - Client-side encryption of object names and contents.
 
-Atomic directory changes, key management, ambiguous commit recovery, and safe
+Atomic directory changes, key lifecycle workflows, ambiguous commit recovery, and safe
 reclamation still need to be designed. The scaffold does not implement or
 guarantee these features.
 

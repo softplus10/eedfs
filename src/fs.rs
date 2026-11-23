@@ -11,7 +11,7 @@ use fuser::{
 const ROOT: INodeNo = INodeNo::ROOT;
 const INFO: INodeNo = INodeNo(2);
 const TTL: Duration = Duration::from_secs(1);
-const CONTENT: &[u8] = b"EEDFS development filesystem\nS3 storage and end-to-end encryption are not implemented yet.\n";
+const CONTENT: &[u8] = b"EEDFS development filesystem\nS3 persistence and encryption are not connected to this FUSE scaffold yet.\n";
 
 pub struct DevFilesystem {
     uid: u32,

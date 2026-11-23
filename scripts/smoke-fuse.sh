@@ -34,7 +34,7 @@ until mountpoint -q "$work/mnt"; do
     sleep 0.1
 done
 ls -la "$work/mnt"
-printf 'EEDFS development filesystem\nS3 storage and end-to-end encryption are not implemented yet.\n' > "$work/expected"
+printf 'EEDFS development filesystem\nS3 persistence and encryption are not connected to this FUSE scaffold yet.\n' > "$work/expected"
 cmp "$work/expected" "$work/mnt/README.txt"
 if touch "$work/mnt/should-fail" 2>/dev/null; then
     echo 'read-only filesystem accepted a write' >&2

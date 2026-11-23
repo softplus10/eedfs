@@ -4,16 +4,14 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use super::codec::{
-    bounded, bounded_bytes, decode_value, encode_value, object_key as root_key, serialize_bytes,
-};
+use super::codec::{bounded, bounded_bytes, decode_value, encode_value, serialize_bytes};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 const MAGIC: &[u8; 8] = b"EEDFSHDR";
 const CONFIG_MAGIC: &[u8; 8] = b"EEDFSCFG";
-/// Version 3 adds protected naming configuration to the Postcard schema.
-pub const VERSION: u16 = 3;
+/// Version 4 uses a root inode ID and removes global data encryption defaults.
+pub const VERSION: u16 = 4;
 pub const MAX_SIZE: usize = 1024 * 1024;
 pub const MAX_KEYSLOTS: usize = 64;
 pub const MAX_PARAMETERS: usize = 4096;
@@ -72,11 +70,18 @@ pub struct Header {
 }
 
 /// Secret naming configuration stored only in the encrypted protected payload.
-/// Key generation and HMAC evaluation are implemented by the future crypto layer.
+/// Used by crypto::naming; never upload the plaintext configuration.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamingConfig {
     pub algorithm: Algorithm,
     pub key: [u8; 32],
+}
+
+impl Drop for NamingConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+    }
 }
 
 impl fmt::Debug for NamingConfig {
@@ -92,10 +97,7 @@ impl fmt::Debug for NamingConfig {
 /// The root inode will carry its own wrapped inode key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectedConfig {
-    #[serde(deserialize_with = "root_key")]
-    pub root_inode: String,
-    pub inode_encryption: Algorithm,
-    pub data_encryption: Algorithm,
+    pub root_inode: [u8; 16],
     pub naming: NamingConfig,
     #[serde(deserialize_with = "bounded::<_, _, MAX_EXTENSIONS>")]
     pub extensions: Vec<Extension>,
@@ -272,9 +274,6 @@ impl Header {
 }
 impl ProtectedConfig {
     fn validate(&self) -> Result<()> {
-        validate_root(&self.root_inode)?;
-        self.inode_encryption.validate()?;
-        self.data_encryption.validate()?;
         self.naming.algorithm.validate()?;
         validate_extensions(&self.extensions)
     }
@@ -288,12 +287,6 @@ impl ProtectedConfig {
         config.validate()?;
         Ok(config)
     }
-}
-fn validate_root(root: &str) -> Result<()> {
-    if root.is_empty() || root.len() > 1024 {
-        return Err(FormatError::Invalid("root inode object key length"));
-    }
-    Ok(())
 }
 pub(super) fn validate_extensions(extensions: &[Extension]) -> Result<()> {
     if extensions.len() > MAX_EXTENSIONS {
@@ -315,7 +308,7 @@ pub(super) fn validate_extensions(extensions: &[Extension]) -> Result<()> {
     Ok(())
 }
 
-// Header v3 keeps its original framing and byte layout.
+// Fixed framing with a versioned Postcard payload.
 fn frame<T: Serialize>(magic: &[u8; 8], value: &T) -> Result<Vec<u8>> {
     super::codec::frame(magic, VERSION, MAX_SIZE, value)
 }

@@ -32,9 +32,7 @@ fn header() -> Header {
 }
 fn config() -> ProtectedConfig {
     ProtectedConfig {
-        root_inode: "root-object-key".into(),
-        inode_encryption: algorithm(1),
-        data_encryption: algorithm(1),
+        root_inode: [0x44; 16],
         naming: NamingConfig {
             algorithm: algorithm(1),
             key: [0x77; 32],
@@ -50,14 +48,14 @@ fn golden(text: &str) -> Vec<u8> {
 
 #[test]
 fn header_matches_independently_encoded_wire_fixture() {
-    let bytes = golden(include_str!("fixtures/header-v3.hex"));
+    let bytes = golden(include_str!("fixtures/header-v4.hex"));
     assert_eq!(header().encode().unwrap(), bytes);
     assert_eq!(Header::decode(&bytes).unwrap(), header());
 }
 
 #[test]
 fn protected_config_matches_wire_fixture_without_a_root_key_field() {
-    let bytes = golden(include_str!("fixtures/header-config-v3.hex"));
+    let bytes = golden(include_str!("fixtures/header-config-v4.hex"));
     assert_eq!(config().encode().unwrap(), bytes);
     assert_eq!(ProtectedConfig::decode(&bytes).unwrap(), config());
 }
@@ -187,15 +185,17 @@ fn bounds_algorithm_parameters_and_rejects_short_tags() {
 }
 
 #[test]
-fn root_locator_must_fit_an_s3_object_key() {
+fn root_is_a_fixed_size_inode_id() {
     let mut value = config();
-    value.root_inode.clear();
-    assert!(value.encode().is_err());
-    value.root_inode = "x".repeat(1025);
-    assert!(value.encode().is_err());
-    let mut bytes = config().encode().unwrap();
-    bytes[17] = 0xff; // Root key follows its one-byte Postcard string length.
-    assert!(ProtectedConfig::decode(&bytes).is_err());
+    value.root_inode = [0; 16];
+    assert_eq!(
+        ProtectedConfig::decode(&value.encode().unwrap()).unwrap(),
+        value
+    );
+    assert_eq!(
+        value.encode().unwrap().len(),
+        config().encode().unwrap().len()
+    );
 }
 
 #[test]
@@ -290,6 +290,7 @@ fn old_experimental_formats_are_rejected_explicitly() {
     for (fixture, version) in [
         (include_str!("fixtures/header-v1.hex"), 1),
         (include_str!("fixtures/header-v2.hex"), 2),
+        (include_str!("fixtures/header-v3.hex"), 3),
     ] {
         assert_eq!(
             Header::decode(&golden(fixture)),
@@ -308,9 +309,9 @@ fn rejects_oversized_deserialized_parameters_and_roots() {
     let mut value = header();
     value.keyslots[0].kdf.parameters = vec![0; MAX_PARAMETERS + 1];
     assert!(Header::decode(&unchecked_frame(b"EEDFSHDR", &value)).is_err());
-    let mut value = config();
-    value.root_inode = "x".repeat(1025);
-    assert!(ProtectedConfig::decode(&unchecked_frame(b"EEDFSCFG", &value)).is_err());
+    let mut bytes = config().encode().unwrap();
+    bytes.remove(16);
+    assert!(ProtectedConfig::decode(&bytes).is_err());
 }
 
 #[test]
