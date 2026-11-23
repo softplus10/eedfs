@@ -1,6 +1,9 @@
 # Inode and data-chunk object formats, version 1
 
-These codecs specify stored envelopes and a minimal inode body. They use the
+These codecs specify stored envelopes and a minimal inode body.
+Implementation modules are `src/format/header.rs`, `inode.rs`, and
+`data_chunk.rs`; `codec.rs` and `common.rs` contain shared internal helpers.
+A directory-entry schema/module remains deferred. They use the
 same Serde/Postcard encoding, canonical decoding, extension rules, and bounded
 allocation helpers as the header. The header remains byte-compatible v3; object
 versions are independent. No encryption, key derivation, HMAC naming, S3 object
@@ -198,3 +201,41 @@ required ones, duplicate/out-of-order extension IDs, unknown inode kinds/content
 tags, malformed lengths, trailing bytes and noncanonical encodings are rejected.
 `InodeBody`/`InodeContent` debug output reports lengths/counts rather than file
 contents. Plaintext body buffers still require future secret-lifetime management.
+
+## Candidate simplification: variable-sized chunk runs (not implemented)
+
+The current implementation stores `object_key + plaintext_len` per chunk and
+allows variable chunk sizes up to the format cap. A maximum size is **not** a
+fixed chunk size: chunk numbers/counts alone do not locate byte boundaries.
+The following is a proposed next schema, not the current v1 wire format:
+
+```text
+ChunkRun {
+    allocation_id: [u8;16],
+    first_chunk: u64,
+    plaintext_lengths: Vec<u32>,
+}
+```
+
+The count is the length-vector length, and object names could be computed from
+the allocation ID and `first_chunk + local_index`. Prefix sums locate logical
+byte offsets. A write replacing one chunk could split an old run into a prefix,
+a fresh-allocation run, and an old suffix. This would preserve COW without
+repeating complete names, while still retaining variable-length boundaries.
+
+A naming rule must first be agreed: the existing explicit-name references let a
+sharing recipient read chunks without the filesystem-wide naming key. Compact
+references must preserve that property. One candidate is deriving a per-inode
+chunk-naming key from the per-inode key, using the protected filesystem naming
+key only for inode names. That changes the naming contract and is not implemented
+or assigned a scheme ID here.
+
+The header already contains `ProtectedConfig.data_encryption` as a default;
+current chunks also store an explicit Algorithm. A raw `nonce || ciphertext+tag`
+chunk encoding could remove that duplication if the caller supplies an
+authenticated suite/layout. The suite defines nonce/tag sizes. Such a schema
+must make its encryption profile immutable for existing chunks, or introduce
+versioned profiles referenced by inode/run metadata; changing a header default
+must never silently change the interpretation of existing chunks. Sharing must
+also convey the relevant authenticated crypto profile. Raw chunk encoding and
+profile evolution remain design proposals, not changes in this refactor.

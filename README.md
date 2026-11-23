@@ -126,7 +126,8 @@ creation/upload. Algorithm-specific cryptographic implementations remain separat
 
 ## Inode and chunk formats
 
-The [object format codecs](docs/object-format.md) define an inode envelope with a
+The [object format codecs](docs/object-format.md), split into `header.rs`,
+`inode.rs`, and `data_chunk.rs` under `src/format/`, define an inode envelope with a
 wrapped per-inode key and encrypted body, plus an immutable data-chunk envelope.
 The minimal inode body contains an ID, kind, generation, and either inline bytes
 or an ordered list of S3 chunk keys/plaintext lengths. Reference helpers construct

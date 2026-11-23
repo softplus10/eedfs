@@ -1,6 +1,8 @@
 use eedfs::format::{
+    MAX_OBJECT_EXTENSION,
+    data_chunk::{DataChunkObject, MAX_CHUNK_PLAINTEXT},
     header::{Algorithm, Extension, FormatError, SealedRegion},
-    objects::*,
+    inode::*,
 };
 use serde::Serialize;
 

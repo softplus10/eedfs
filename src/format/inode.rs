@@ -1,31 +1,25 @@
-//! Initial inode/chunk formats. No encryption, S3 writes or filesystem operations.
+//! Inode envelope and minimal inline/chunk-reference body. No filesystem operations.
 
 use super::{
     codec,
-    header::{
-        Extension, FormatError, MAX_EXTENSIONS, SealedRegion,
-        validate_extensions as validate_base_extensions,
-    },
+    common::{MAX_METADATA_SIZE, object_aad, validate_extensions},
+    header::{Extension, FormatError, MAX_EXTENSIONS, SealedRegion},
 };
-use codec::{bounded, bounded_bytes, object_key, serialize_bytes};
+use codec::bounded;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 type Result<T> = std::result::Result<T, FormatError>;
+use super::data_chunk::{DataChunkObject, MAX_CHUNK_PLAINTEXT};
+use codec::{bounded_bytes, object_key, serialize_bytes};
+use std::fmt;
 
-/// Inode/chunk schema versions are independent of the filesystem header version.
 pub const VERSION: u16 = 1;
 pub const FILE: u8 = 1;
 pub const DIRECTORY: u8 = 2;
 pub const MAX_INLINE_SIZE: usize = 64 * 1024;
 pub const MAX_CHUNK_REFERENCES: usize = 4096;
-pub const MAX_OBJECT_EXTENSION: usize = 4096;
-pub const MAX_INODE_SIZE: usize = 1024 * 1024;
-pub const MAX_CHUNK_PLAINTEXT: usize = 64 * 1024 * 1024;
-pub const MAX_CHUNK_CIPHERTEXT: usize = MAX_CHUNK_PLAINTEXT + 64;
-pub const MAX_CHUNK_SIZE: usize = MAX_CHUNK_PLAINTEXT + MAX_INODE_SIZE;
+pub const MAX_INODE_SIZE: usize = MAX_METADATA_SIZE;
 const INODE_MAGIC: &[u8; 8] = b"EEDFSINO";
 const BODY_MAGIC: &[u8; 8] = b"EEDFSINB";
-const CHUNK_MAGIC: &[u8; 8] = b"EEDFSCHK";
 
 /// Public S3 inode envelope: a wrapped per-inode key and a separately sealed body.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,14 +133,6 @@ impl InodeContent {
     }
 }
 
-/// Immutable chunk envelope. The tag is part of protected.ciphertext.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DataChunkObject {
-    pub protected: SealedRegion<MAX_CHUNK_CIPHERTEXT>,
-    #[serde(deserialize_with = "bounded::<_, _, MAX_EXTENSIONS>")]
-    pub extensions: Vec<Extension>,
-}
-
 impl InodeObject {
     fn validate(&self) -> Result<()> {
         self.wrapped_inode_key.validate()?;
@@ -168,6 +154,7 @@ impl InodeObject {
         validate_extensions(&self.extensions)?;
         object_aad(
             b"EEDFS/inode-key\0",
+            VERSION,
             filesystem_id,
             object_key,
             &(
@@ -184,6 +171,7 @@ impl InodeObject {
         validate_extensions(&self.extensions)?;
         object_aad(
             b"EEDFS/inode-body\0",
+            VERSION,
             filesystem_id,
             object_key,
             &(
@@ -216,59 +204,4 @@ impl InodeBody {
         value.validate()?;
         Ok(value)
     }
-}
-impl DataChunkObject {
-    fn validate(&self) -> Result<()> {
-        self.protected.validate()?;
-        validate_extensions(&self.extensions)
-    }
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
-        codec::frame(CHUNK_MAGIC, VERSION, MAX_CHUNK_SIZE, self)
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let value: Self = codec::unframe(CHUNK_MAGIC, VERSION, MAX_CHUNK_SIZE, bytes)?;
-        value.validate()?;
-        Ok(value)
-    }
-    /// Stable across file-offset changes: bind immutable object identity, not logical offset.
-    pub fn aad(&self, filesystem_id: &[u8; 16], object_key: &str) -> Result<Vec<u8>> {
-        self.protected.validate_descriptor()?;
-        validate_extensions(&self.extensions)?;
-        object_aad(
-            b"EEDFS/data-chunk\0",
-            filesystem_id,
-            object_key,
-            &(
-                &self.protected.algorithm,
-                &self.protected.nonce,
-                &self.extensions,
-            ),
-        )
-    }
-}
-fn object_aad<T: Serialize>(
-    domain: &[u8],
-    filesystem_id: &[u8; 16],
-    key: &str,
-    metadata: &T,
-) -> Result<Vec<u8>> {
-    codec::validate_object_key(key)?;
-    let mut out = domain.to_vec();
-    out.extend_from_slice(&codec::encode_value(
-        &(VERSION, filesystem_id, key, metadata),
-        MAX_INODE_SIZE + 2048 - domain.len(),
-    )?);
-    Ok(out)
-}
-
-fn validate_extensions(extensions: &[Extension]) -> Result<()> {
-    validate_base_extensions(extensions)?;
-    if extensions
-        .iter()
-        .any(|extension| extension.value.len() > MAX_OBJECT_EXTENSION)
-    {
-        return Err(FormatError::TooLarge);
-    }
-    Ok(())
 }
