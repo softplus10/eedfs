@@ -1,13 +1,14 @@
-# Inode and data-chunk format v2
+# Inode v3 and data-chunk v2 formats
 
-Experimental; incompatible with v1. Header is independently versioned at v4.
+Experimental; inode v1/v2 are rejected. Inode v3 removes the stored per-file
+chunk-size cap. Header is independently versioned at v4.
 Code lives in `src/format/{header,inode,data_chunk}.rs`. No directory entry format,
 POSIX metadata, S3 object publication, or filesystem transaction is implemented.
 
 ## Inode envelope
 
 `EEDFSINO` + the 16-byte framing convention in [header format](header-format.md),
-version 2, followed by canonical Postcard:
+version 3, followed by canonical Postcard:
 
 ```
 InodeObject {
@@ -22,7 +23,7 @@ Distinct body and chunk keys are derived from that inode key using HKDF. Wrappin
 and body profiles are independently described by the envelope. Creation currently
 uses the selected AEAD for both. Both supported AEADs are allowed for wrapping.
 
-Decrypted body has its own `EEDFSINB` frame, version 2:
+Decrypted body has its own `EEDFSINB` frame, version 3:
 
 ```
 InodeBody {
@@ -33,7 +34,6 @@ InodeBody {
 InodeContent = Inline(Vec<u8>) | Chunks(ChunkedContent)
 ChunkedContent {
   naming: NamingConfig,             // per-file secret, not the global naming key
-  max_chunk_size:u32,
   runs: Vec<ChunkRun>,
 }
 ChunkRun {
@@ -51,7 +51,9 @@ COW updates split/reuse old runs and allocate new IDs for new runs. Naming input
 are allocation ID plus chunk number, not file offset or inode generation.
 
 Limits: inode frame <=1 MiB; inline <=64 KiB; at most 4096 total chunk references
-and 4096 runs; each run nonempty, chunk lengths 1..=max_chunk_size, maximum <=64 MiB.
+and 4096 runs; each run nonempty, chunk lengths 1 byte through 64 MiB (an implementation safety limit).
+No per-file maximum or end index is stored. The last index is first_chunk plus
+the length-vector size minus one; chunk sizing is a writer policy.
 Index addition and size sums are checked. The current flat list therefore has a
 scalability ceiling; a larger index is future work. Object extensions have at most
 4096 bytes each and otherwise follow the header extension rules.
@@ -81,9 +83,9 @@ AAD is raw domain then canonical Postcard tuple. Version is u16; expected chunk
 plaintext length is u32. `metadata` in these contexts excludes the region's own
 ciphertext. Every context binds the trusted filesystem ID and exact S3 key.
 
-- `EEDFS/inode-key\0`: `(2, fs_id, object_key,
+- `EEDFS/inode-key\0`: `(3, fs_id, object_key,
   (wrapping_algorithm, wrapping_nonce, extensions))`.
-- `EEDFS/inode-body\0`: `(2, fs_id, object_key,
+- `EEDFS/inode-body\0`: `(3, fs_id, object_key,
   (full_wrapped_key_region, body_algorithm, body_nonce, extensions))`.
 - `EEDFS/data-chunk\0`: `(2, fs_id, object_key,
   (common_algorithm, chunk_nonce, expected_plaintext_length))`.

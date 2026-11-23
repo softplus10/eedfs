@@ -117,7 +117,7 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 
 - [Header v4](docs/header-format.md): password keyslots, protected root inode ID
   and filesystem-wide inode naming configuration.
-- [Inode/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
+- [Inode v3/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
   encryption profile, inline data or variable-size chunk runs. Chunk bytes contain
   only nonce and ciphertext/tag; names derive from allocation ID and chunk index.
 - [Crypto profiles and key hierarchy](docs/crypto.md): XChaCha20-Poly1305,

@@ -4,6 +4,7 @@ use super::{common::object_aad, header::Algorithm};
 use crate::crypto::{Error, Result, encryption};
 
 pub const VERSION: u16 = 2;
+/// Decoder resource limit, not a persisted per-file chunk sizing policy.
 pub const MAX_CHUNK_PLAINTEXT: usize = 64 * 1024 * 1024;
 
 /// Wire representation: nonce || ciphertext || 16-byte authentication tag.

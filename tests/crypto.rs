@@ -87,7 +87,6 @@ fn password_header_inode_chunk_and_sharing_roundtrip_with_cow() {
                 algorithm: naming::algorithm().unwrap(),
                 key: crypto::random_array().unwrap(),
             },
-            max_chunk_size: 8192,
             runs: vec![ChunkRun {
                 allocation_id: crypto::random_array().unwrap(),
                 first_chunk: 10,

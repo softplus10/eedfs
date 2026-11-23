@@ -77,7 +77,6 @@ fn main() {
         generation: 1,
         content: InodeContent::Chunks(ChunkedContent {
             naming: naming.clone(),
-            max_chunk_size: 8 * 1048576,
             runs: vec![ChunkRun {
                 allocation_id: [4; 16],
                 first_chunk: 0,

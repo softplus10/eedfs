@@ -12,7 +12,7 @@ use super::data_chunk::MAX_CHUNK_PLAINTEXT;
 use codec::{bounded_bytes, serialize_bytes};
 use std::fmt;
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const FILE: u8 = 1;
 pub const DIRECTORY: u8 = 2;
 pub const MAX_INLINE_SIZE: usize = 64 * 1024;
@@ -53,7 +53,7 @@ impl fmt::Debug for InodeBody {
     }
 }
 
-/// Persisted enum tags are fixed by schema v2: Inline=0, Chunks=1.
+/// Persisted enum tags are fixed by schema v3: Inline=0, Chunks=1.
 /// Reordering/inserting variants is a format change, not an implementation detail.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InodeContent {
@@ -83,7 +83,6 @@ impl fmt::Debug for InodeContent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkedContent {
     pub naming: NamingConfig,
-    pub max_chunk_size: u32,
     #[serde(deserialize_with = "bounded::<_, _, MAX_CHUNK_REFERENCES>")]
     pub runs: Vec<ChunkRun>,
 }
@@ -99,11 +98,7 @@ pub struct ChunkRun {
 impl ChunkedContent {
     pub fn size(&self) -> Result<u64> {
         self.naming.algorithm.validate()?;
-        if self.max_chunk_size == 0
-            || self.max_chunk_size as usize > MAX_CHUNK_PLAINTEXT
-            || self.runs.is_empty()
-            || self.runs.len() > MAX_CHUNK_REFERENCES
-        {
+        if self.runs.is_empty() || self.runs.len() > MAX_CHUNK_REFERENCES {
             return Err(FormatError::Invalid("chunk configuration"));
         }
         let mut count = 0usize;
@@ -122,7 +117,7 @@ impl ChunkedContent {
                 return Err(FormatError::TooLarge);
             }
             for &len in &run.plaintext_lengths {
-                if len == 0 || len > self.max_chunk_size {
+                if len == 0 || len as usize > MAX_CHUNK_PLAINTEXT {
                     return Err(FormatError::Invalid("chunk plaintext length"));
                 }
                 size = size

@@ -27,7 +27,6 @@ fn body() -> InodeBody {
 fn chunks() -> ChunkedContent {
     ChunkedContent {
         naming: naming(),
-        max_chunk_size: 8192,
         runs: vec![ChunkRun {
             allocation_id: [3; 16],
             first_chunk: 0,
@@ -117,9 +116,6 @@ fn truncation_canonical_mutations_and_version_checks() {
 fn run_limits_and_index_overflow_are_checked_on_decode_too() {
     let mut invalid = Vec::new();
     let mut c = chunks();
-    c.max_chunk_size = 0;
-    invalid.push(c);
-    let mut c = chunks();
     c.runs.clear();
     invalid.push(c);
     let mut c = chunks();
@@ -132,7 +128,7 @@ fn run_limits_and_index_overflow_are_checked_on_decode_too() {
     c.runs[0].plaintext_lengths = vec![0];
     invalid.push(c);
     let mut c = chunks();
-    c.runs[0].plaintext_lengths = vec![8193];
+    c.runs[0].plaintext_lengths = vec![eedfs::format::data_chunk::MAX_CHUNK_PLAINTEXT as u32 + 1];
     invalid.push(c);
     let mut c = chunks();
     c.runs[0].plaintext_lengths = vec![1; MAX_CHUNK_REFERENCES + 1];
@@ -199,7 +195,7 @@ fn inode_aad_binds_filesystem_location_and_wrapped_key() {
 }
 
 #[test]
-fn v2_matches_independently_encoded_fixtures() {
+fn v3_matches_independently_encoded_fixtures() {
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()
             .map(|v| u8::from_str_radix(v, 16).unwrap())
@@ -207,11 +203,11 @@ fn v2_matches_independently_encoded_fixtures() {
     }
     assert_eq!(
         body().encode().unwrap(),
-        hex(include_str!("fixtures/inode-inline-v2.hex"))
+        hex(include_str!("fixtures/inode-inline-v3.hex"))
     );
     assert_eq!(
         object().encode().unwrap(),
-        hex(include_str!("fixtures/inode-object-v2.hex"))
+        hex(include_str!("fixtures/inode-object-v3.hex"))
     );
     let b = InodeBody {
         content: InodeContent::Chunks(chunks()),
@@ -219,7 +215,7 @@ fn v2_matches_independently_encoded_fixtures() {
     };
     assert_eq!(
         b.encode().unwrap(),
-        hex(include_str!("fixtures/inode-chunks-v2.hex"))
+        hex(include_str!("fixtures/inode-chunks-v3.hex"))
     );
     assert_eq!(
         InodeBody::decode(&hex(include_str!("fixtures/inode-inline-v1.hex"))),
@@ -229,4 +225,29 @@ fn v2_matches_independently_encoded_fixtures() {
         InodeObject::decode(&hex(include_str!("fixtures/inode-object-v1.hex"))),
         Err(FormatError::UnsupportedVersion(1))
     );
+}
+
+#[test]
+fn previous_inode_version_is_rejected_and_lengths_need_no_file_maximum() {
+    fn hex(s: &str) -> Vec<u8> {
+        s.split_whitespace()
+            .map(|v| u8::from_str_radix(v, 16).unwrap())
+            .collect()
+    }
+    assert_eq!(
+        InodeBody::decode(&hex(include_str!("fixtures/inode-chunks-v2.hex"))),
+        Err(FormatError::UnsupportedVersion(2))
+    );
+    assert_eq!(
+        InodeObject::decode(&hex(include_str!("fixtures/inode-object-v2.hex"))),
+        Err(FormatError::UnsupportedVersion(2))
+    );
+    let mut content = chunks();
+    content.runs[0].first_chunk = u64::MAX;
+    content.runs[0].plaintext_lengths = vec![eedfs::format::data_chunk::MAX_CHUNK_PLAINTEXT as u32];
+    let b = InodeBody {
+        content: InodeContent::Chunks(content),
+        ..body()
+    };
+    assert_eq!(InodeBody::decode(&b.encode().unwrap()).unwrap(), b);
 }
