@@ -1,0 +1,465 @@
+//! Conditional namespace edits. Cross-directory rename is destination-first;
+//! interrupted changes are intentionally not recovered.
+use super::{Error, Lease, Loaded, Result, Volume};
+use crate::{
+    crypto,
+    format::{
+        directory::{Directory, Entry},
+        inode::{self, InodeContent},
+        metadata::{Metadata, Timestamp},
+    },
+};
+use std::collections::BTreeSet;
+
+fn directory(loaded: &Loaded) -> Result<Directory> {
+    if loaded.body.deleted {
+        return Err(Error::Missing);
+    }
+    if loaded.body.kind != inode::DIRECTORY {
+        return Err(Error::NotDirectory);
+    }
+    let InodeContent::Inline(bytes) = &loaded.body.content else {
+        return Err(Error::Invalid);
+    };
+    Ok(Directory::decode(bytes)?)
+}
+fn entry(d: &Directory, name: &str) -> Option<Entry> {
+    d.entries.iter().find(|e| e.name == name).cloned()
+}
+fn replace(d: &mut Directory, name: &str, next: Option<Entry>) {
+    d.entries.retain(|e| e.name != name);
+    if let Some(e) = next {
+        d.entries.push(e);
+    }
+    d.entries.sort_by(|a, b| a.name.cmp(&b.name));
+}
+fn validate_name(name: &str) -> Result<()> {
+    Directory {
+        entries: vec![Entry {
+            name: name.into(),
+            id: [1; 16],
+            kind: inode::FILE,
+        }],
+    }
+    .encode()?;
+    Ok(())
+}
+fn guard(leases: &mut [Lease], id: [u8; 16]) -> Result<&mut Lease> {
+    leases
+        .iter_mut()
+        .find(|l| l.inode().body.id == id)
+        .ok_or(Error::Invalid)
+}
+fn check(leases: &[Lease]) -> Result<()> {
+    for l in leases {
+        l.check_owner_time()?;
+    }
+    Ok(())
+}
+async fn pause(attempt: u32) {
+    tokio::time::sleep(std::time::Duration::from_millis(
+        (5u64 << attempt.min(5)).min(160),
+    ))
+    .await;
+}
+impl Volume {
+    async fn lock_directories(
+        &self,
+        ids: impl IntoIterator<Item = [u8; 16]>,
+    ) -> Result<Vec<Lease>> {
+        let ids: BTreeSet<_> = ids.into_iter().collect();
+        for attempt in 0..16 {
+            let mut held = Vec::new();
+            let mut failure = None;
+            for id in &ids {
+                match self.acquire_directory_lease(*id).await {
+                    Ok(l) => held.push(l),
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            if failure.is_none() {
+                return Ok(held);
+            }
+            for l in held.into_iter().rev() {
+                let _ = self.release_directory_lease(l).await;
+            }
+            match failure.unwrap() {
+                Error::Conflict => pause(attempt).await,
+                e => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
+    }
+    async fn unlock_directories(&self, held: Vec<Lease>, result: Result<()>) -> Result<()> {
+        let mut failure = None;
+        for l in held.into_iter().rev() {
+            if let Err(e) = self.release_directory_lease(l).await {
+                failure.get_or_insert(e);
+            }
+        }
+        result?;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn edit_entry(
+        &self,
+        parent: [u8; 16],
+        name: &str,
+        expected: Option<Entry>,
+        next: Option<Entry>,
+    ) -> Result<()> {
+        validate_name(name)?;
+        for attempt in 0..16 {
+            let loaded = match self.load_writable(parent).await {
+                Ok(l) => l,
+                Err(Error::Conflict) => {
+                    pause(attempt).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let mut d = directory(&loaded)?;
+            if entry(&d, name) != expected {
+                return Err(Error::Conflict);
+            }
+            replace(&mut d, name, next.clone());
+            let mut body = loaded.body.clone();
+            body.content = InodeContent::Inline(d.encode()?);
+            body.nlink = 2 + d
+                .entries
+                .iter()
+                .filter(|e| e.kind == inode::DIRECTORY)
+                .count() as u32;
+            body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
+            body.metadata.mtime = Timestamp::now();
+            body.metadata.ctime = body.metadata.mtime;
+            match self.publish(&loaded, &body, Some(&loaded.etag)).await {
+                Ok(_) => return Ok(()),
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
+    }
+    pub async fn create(&self, parent: [u8; 16], name: &str, kind: u8) -> Result<Loaded> {
+        self.create_with_metadata(
+            parent,
+            name,
+            kind,
+            Metadata::new(
+                0,
+                0,
+                if kind == inode::DIRECTORY {
+                    0o755
+                } else {
+                    0o644
+                },
+            ),
+        )
+        .await
+    }
+    pub async fn create_with_metadata(
+        &self,
+        parent: [u8; 16],
+        name: &str,
+        kind: u8,
+        metadata: Metadata,
+    ) -> Result<Loaded> {
+        if !matches!(kind, inode::FILE | inode::DIRECTORY) {
+            return Err(Error::Invalid);
+        }
+        self.create_entry(parent, name, kind, metadata, None).await
+    }
+    async fn create_entry(
+        &self,
+        parent: [u8; 16],
+        name: &str,
+        kind: u8,
+        metadata: Metadata,
+        content: Option<Vec<u8>>,
+    ) -> Result<Loaded> {
+        validate_name(name)?;
+        if entry(&directory(&self.load(parent).await?)?, name).is_some() {
+            return Err(Error::Exists);
+        }
+        let loaded = if let Some(content) = content {
+            self.create_inode_content(crypto::random_array()?, kind, metadata, content)
+                .await?
+        } else {
+            self.create_inode(crypto::random_array()?, kind, metadata)
+                .await?
+        };
+        let e = Entry {
+            name: name.into(),
+            id: loaded.body.id,
+            kind,
+        };
+        if kind == inode::DIRECTORY {
+            let mut held = self.lock_directories([self.root, parent]).await?;
+            let result = async {
+                let l = guard(&mut held, parent)?;
+                let mut d = directory(l.inode())?;
+                if entry(&d, name).is_some() {
+                    return Err(Error::Conflict);
+                }
+                replace(&mut d, name, Some(e));
+                self.write_leased_directory(l, &d).await
+            }
+            .await;
+            self.unlock_directories(held, result).await?;
+        } else {
+            self.edit_entry(parent, name, None, Some(e)).await?;
+        }
+        Ok(loaded)
+    }
+    pub async fn symlink(
+        &self,
+        parent: [u8; 16],
+        name: &str,
+        target: &[u8],
+        metadata: Metadata,
+    ) -> Result<Loaded> {
+        if target.is_empty() || target.len() > 4096 || target.contains(&0) {
+            return Err(Error::Invalid);
+        }
+        self.create_entry(
+            parent,
+            name,
+            inode::SYMLINK,
+            metadata,
+            Some(target.to_vec()),
+        )
+        .await
+    }
+    pub async fn readlink(&self, id: [u8; 16]) -> Result<Vec<u8>> {
+        let l = self.load(id).await?;
+        if l.body.kind != inode::SYMLINK {
+            return Err(Error::Invalid);
+        }
+        let InodeContent::Inline(bytes) = l.body.content else {
+            return Err(Error::Invalid);
+        };
+        Ok(bytes)
+    }
+    async fn change_links(&self, id: [u8; 16], delta: i32) -> Result<Loaded> {
+        for _ in 0..16 {
+            let mut l = self.load_writable(id).await?;
+            let mut b = l.body.clone();
+            b.nlink = if delta < 0 {
+                b.nlink.saturating_sub(delta.unsigned_abs())
+            } else {
+                b.nlink.checked_add(delta as u32).ok_or(Error::TooLarge)?
+            };
+            b.generation = b.generation.checked_add(1).ok_or(Error::TooLarge)?;
+            b.metadata.ctime = Timestamp::now();
+            match self.publish(&l, &b, Some(&l.etag)).await {
+                Ok(e) => {
+                    l.body = b;
+                    l.etag = e;
+                    return Ok(l);
+                }
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
+    }
+    pub async fn link(&self, id: [u8; 16], parent: [u8; 16], name: &str) -> Result<Loaded> {
+        validate_name(name)?;
+        let l = self.load(id).await?;
+        if l.body.kind == inode::DIRECTORY {
+            return Err(Error::Permission);
+        }
+        if entry(&directory(&self.load(parent).await?)?, name).is_some() {
+            return Err(Error::Exists);
+        }
+        self.change_links(id, 1).await?;
+        if let Err(e) = self
+            .edit_entry(
+                parent,
+                name,
+                None,
+                Some(Entry {
+                    name: name.into(),
+                    id,
+                    kind: l.body.kind,
+                }),
+            )
+            .await
+        {
+            let _ = self.change_links(id, -1).await;
+            return Err(e);
+        }
+        self.load(id).await
+    }
+    pub async fn unlink(&self, parent: [u8; 16], name: &str) -> Result<()> {
+        let e = entry(&directory(&self.load(parent).await?)?, name).ok_or(Error::Missing)?;
+        if e.kind == inode::DIRECTORY {
+            return Err(Error::IsDirectory);
+        }
+        self.edit_entry(parent, name, Some(e.clone()), None).await?;
+        self.change_links(e.id, -1).await?;
+        Ok(())
+    }
+    pub async fn rmdir(&self, parent: [u8; 16], name: &str) -> Result<()> {
+        validate_name(name)?;
+        let e = entry(&directory(&self.load(parent).await?)?, name).ok_or(Error::Missing)?;
+        if e.kind != inode::DIRECTORY {
+            return Err(Error::NotDirectory);
+        }
+        let mut held = self.lock_directories([self.root, parent, e.id]).await?;
+        let result = async {
+            let mut d = directory(guard(&mut held, parent)?.inode())?;
+            if entry(&d, name) != Some(e.clone()) {
+                return Err(Error::Conflict);
+            }
+            check(&held)?;
+            self.retire_directory(guard(&mut held, e.id)?).await?;
+            replace(&mut d, name, None);
+            check(&held)?;
+            self.write_leased_directory(guard(&mut held, parent)?, &d)
+                .await
+        }
+        .await;
+        self.unlock_directories(held, result).await
+    }
+    async fn directory_tree(&self, root: [u8; 16]) -> Result<BTreeSet<[u8; 16]>> {
+        let mut todo = vec![root];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if seen.len() > 65536 {
+                return Err(Error::TooLarge);
+            }
+            todo.extend(
+                self.list(id)
+                    .await?
+                    .into_iter()
+                    .filter(|e| e.kind == inode::DIRECTORY)
+                    .map(|e| e.id),
+            );
+        }
+        Ok(seen)
+    }
+    pub async fn rename(
+        &self,
+        parent: [u8; 16],
+        name: &str,
+        new_parent: [u8; 16],
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<()> {
+        validate_name(name)?;
+        validate_name(new_name)?;
+        let source = entry(&directory(&self.load(parent).await?)?, name).ok_or(Error::Missing)?;
+        let target = entry(&directory(&self.load(new_parent).await?)?, new_name);
+        if no_replace && target.is_some() {
+            return Err(Error::Exists);
+        }
+        if parent == new_parent && name == new_name {
+            return Ok(());
+        }
+        if target.as_ref().is_some_and(|e| e.id == source.id) {
+            return Ok(());
+        }
+        if let Some(t) = &target {
+            match (source.kind == inode::DIRECTORY, t.kind == inode::DIRECTORY) {
+                (true, false) => return Err(Error::NotDirectory),
+                (false, true) => return Err(Error::IsDirectory),
+                _ => {}
+            }
+        }
+        let topology = source.kind == inode::DIRECTORY;
+        let tree = if topology {
+            self.directory_tree(source.id).await?
+        } else {
+            BTreeSet::new()
+        };
+        if tree.contains(&new_parent) {
+            return Err(Error::Invalid);
+        }
+        let mut ids = vec![parent, new_parent];
+        if topology {
+            ids.push(self.root);
+            ids.extend(tree.iter().copied());
+        }
+        if let Some(t) = &target
+            && t.kind == inode::DIRECTORY
+        {
+            ids.push(t.id);
+        }
+        let mut held = self.lock_directories(ids).await?;
+        let result = async {
+            let mut from = directory(guard(&mut held, parent)?.inode())?;
+            let mut to = directory(guard(&mut held, new_parent)?.inode())?;
+            if entry(&from, name) != Some(source.clone()) || entry(&to, new_name) != target {
+                return Err(Error::Conflict);
+            }
+            if topology {
+                let current_tree = self.directory_tree(source.id).await?;
+                if current_tree.contains(&new_parent) {
+                    return Err(Error::Invalid);
+                }
+                if current_tree != tree {
+                    return Err(Error::Conflict);
+                }
+            }
+            check(&held)?;
+            if let Some(t) = &target
+                && t.kind == inode::DIRECTORY
+                && !directory(guard(&mut held, t.id)?.inode())?
+                    .entries
+                    .is_empty()
+            {
+                return Err(Error::NotEmpty);
+            }
+            let moved = Entry {
+                name: new_name.into(),
+                ..source.clone()
+            };
+            if parent == new_parent {
+                replace(&mut from, name, None);
+                replace(&mut from, new_name, Some(moved));
+                check(&held)?;
+                self.write_leased_directory(guard(&mut held, parent)?, &from)
+                    .await?;
+            } else {
+                replace(&mut to, new_name, Some(moved));
+                check(&held)?;
+                self.write_leased_directory(guard(&mut held, new_parent)?, &to)
+                    .await?;
+                replace(&mut from, name, None);
+                check(&held)?;
+                self.write_leased_directory(guard(&mut held, parent)?, &from)
+                    .await?;
+            }
+            if let Some(t) = &target
+                && t.kind == inode::DIRECTORY
+            {
+                check(&held)?;
+                self.retire_directory(guard(&mut held, t.id)?).await?;
+            }
+            if source.kind != inode::DIRECTORY {
+                self.change_links(source.id, 0).await?;
+            } else {
+                check(&held)?;
+                self.touch_directory(guard(&mut held, source.id)?).await?;
+            }
+            if let Some(t) = &target
+                && t.kind != inode::DIRECTORY
+            {
+                self.change_links(t.id, -1).await?;
+            }
+            Ok(())
+        }
+        .await;
+        self.unlock_directories(held, result).await
+    }
+}

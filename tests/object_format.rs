@@ -22,6 +22,10 @@ fn body() -> InodeBody {
         generation: 7,
         metadata: Default::default(),
         lease: None,
+        deleted: false,
+        nlink: 1,
+
+        mutations: vec![],
         content: InodeContent::Inline(b"hello".to_vec()),
         extensions: vec![],
     }
@@ -29,6 +33,7 @@ fn body() -> InodeBody {
 fn chunks() -> ChunkedContent {
     ChunkedContent {
         naming: naming(),
+        holes: vec![],
         runs: vec![ChunkRun {
             allocation_id: [3; 16],
             first_chunk: 0,
@@ -197,7 +202,7 @@ fn inode_aad_binds_filesystem_location_and_wrapped_key() {
 }
 
 #[test]
-fn v5_matches_independently_encoded_fixtures() {
+fn v6_matches_independently_encoded_fixtures() {
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()
             .map(|v| u8::from_str_radix(v, 16).unwrap())
@@ -205,11 +210,11 @@ fn v5_matches_independently_encoded_fixtures() {
     }
     assert_eq!(
         body().encode().unwrap(),
-        hex(include_str!("fixtures/inode-inline-v5.hex"))
+        hex(include_str!("fixtures/inode-inline-v6.hex"))
     );
     assert_eq!(
         object().encode().unwrap(),
-        hex(include_str!("fixtures/inode-object-v5.hex"))
+        hex(include_str!("fixtures/inode-object-v6.hex"))
     );
     let b = InodeBody {
         content: InodeContent::Chunks(chunks()),
@@ -217,7 +222,7 @@ fn v5_matches_independently_encoded_fixtures() {
     };
     assert_eq!(
         b.encode().unwrap(),
-        hex(include_str!("fixtures/inode-chunks-v5.hex"))
+        hex(include_str!("fixtures/inode-chunks-v6.hex"))
     );
     assert_eq!(
         InodeBody::decode(&hex(include_str!("fixtures/inode-inline-v1.hex"))),
@@ -321,5 +326,53 @@ fn lease_is_directory_only_and_previous_inode_schema_is_rejected() {
     assert_eq!(
         InodeObject::decode(&old),
         Err(FormatError::UnsupportedVersion(4))
+    );
+}
+
+#[test]
+fn sparse_holes_are_bounded_ordered_and_align_with_chunk_boundaries() {
+    let mut c = chunks();
+    c.holes = vec![
+        Hole {
+            offset: 0,
+            len: 100,
+        },
+        Hole {
+            offset: 105,
+            len: 1000,
+        },
+        Hole {
+            offset: 1111,
+            len: 1,
+        },
+    ];
+    assert_eq!(c.size().unwrap(), 1112);
+    let b = InodeBody {
+        content: InodeContent::Chunks(c.clone()),
+        ..body()
+    };
+    assert_eq!(InodeBody::decode(&b.encode().unwrap()).unwrap(), b);
+    c.holes[1].offset = 104;
+    assert!(c.size().is_err());
+    c.holes = vec![Hole {
+        offset: 0,
+        len: u64::MAX,
+    }];
+    assert!(c.size().is_err());
+    c.runs.clear();
+    c.holes = vec![Hole {
+        offset: 0,
+        len: 1 << 40,
+    }];
+    assert_eq!(c.size().unwrap(), 1 << 40);
+    c.holes[0].len = 0;
+    assert!(c.size().is_err());
+    let old = include_str!("fixtures/inode-inline-v5.hex")
+        .split_whitespace()
+        .map(|s| u8::from_str_radix(s, 16).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        InodeBody::decode(&old),
+        Err(FormatError::UnsupportedVersion(5))
     );
 }

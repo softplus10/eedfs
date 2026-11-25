@@ -32,7 +32,7 @@ impl Lease {
             .expect("acquired lease")
             .expires_at
     }
-    fn check_owner_time(&self) -> Result<()> {
+    pub(super) fn check_owner_time(&self) -> Result<()> {
         let stop = self
             .expires_at()
             .to_system_time()?
@@ -67,6 +67,9 @@ impl Volume {
     /// previous owner is still running, this CAS makes its ETag unusable.
     pub(super) async fn load_writable(&self, id: [u8; 16]) -> Result<Loaded> {
         let mut loaded = self.load(id).await?;
+        if loaded.body.deleted {
+            return Err(Error::Missing);
+        }
         if let Some(lease) = &loaded.body.lease {
             if !can_take_over(lease, SystemTime::now())? {
                 return Err(Error::Conflict);
@@ -90,6 +93,9 @@ impl Volume {
     ) -> Result<Lease> {
         let expires_at = expiration(duration)?;
         let mut loaded = self.load(id).await?;
+        if loaded.body.deleted {
+            return Err(Error::Missing);
+        }
         if loaded.body.kind != inode::DIRECTORY {
             return Err(Error::NotDirectory);
         }
@@ -131,7 +137,15 @@ impl Volume {
         directory: &Directory,
     ) -> Result<()> {
         lease.check_owner_time()?;
+        if lease.loaded.body.deleted {
+            return Err(Error::Missing);
+        }
         let mut body = lease.loaded.body.clone();
+        body.nlink = 2 + directory
+            .entries
+            .iter()
+            .filter(|e| e.kind == inode::DIRECTORY)
+            .count() as u32;
         body.content = InodeContent::Inline(directory.encode()?);
         body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
         body.metadata.mtime = Timestamp::now();
@@ -144,6 +158,36 @@ impl Volume {
         // A slow response does not imply rollback: the caller must stop using
         // an expired handle, including when the conditional PUT was applied.
         lease.check_owner_time()
+    }
+    pub(super) async fn touch_directory(&self, lease: &mut Lease) -> Result<()> {
+        lease.check_owner_time()?;
+        let mut body = lease.loaded.body.clone();
+        body.metadata.ctime = Timestamp::now();
+        body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
+        lease.loaded.etag = self
+            .publish_raw(&lease.loaded, &body, Some(&lease.loaded.etag))
+            .await?;
+        lease.loaded.body = body;
+        Ok(())
+    }
+    pub(super) async fn retire_directory(&self, lease: &mut Lease) -> Result<()> {
+        lease.check_owner_time()?;
+        let InodeContent::Inline(bytes) = &lease.loaded.body.content else {
+            return Err(Error::Invalid);
+        };
+        if !Directory::decode(bytes)?.entries.is_empty() {
+            return Err(Error::NotEmpty);
+        }
+        let mut body = lease.loaded.body.clone();
+        body.deleted = true;
+        body.metadata.ctime = Timestamp::now();
+        body.nlink = 0;
+        body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
+        lease.loaded.etag = self
+            .publish_raw(&lease.loaded, &body, Some(&lease.loaded.etag))
+            .await?;
+        lease.loaded.body = body;
+        Ok(())
     }
     pub async fn release_directory_lease(&self, lease: Lease) -> Result<()> {
         lease.check_owner_time()?;

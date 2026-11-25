@@ -27,6 +27,8 @@ pub enum Error {
     TooLarge,
     NotEmpty,
     Permission,
+    IsDirectory,
+    Unsupported,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -65,6 +67,7 @@ impl From<tokio::task::JoinError> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 mod lease;
 mod metadata;
+mod namespace;
 pub use lease::Lease;
 mod session;
 pub mod snapshots;
@@ -100,8 +103,16 @@ fn pieces(body: &InodeBody) -> Vec<Piece> {
     let mut result = Vec::new();
     let mut offset = 0;
     if let InodeContent::Chunks(c) = &body.content {
+        let mut holes = c.holes.iter().peekable();
         for run in &c.runs {
             for (i, &len) in run.plaintext_lengths.iter().enumerate() {
+                while let Some(h) = holes.peek() {
+                    if h.offset != offset {
+                        break;
+                    }
+                    offset += h.len;
+                    holes.next();
+                }
                 result.push(Piece {
                     offset,
                     len,
@@ -299,6 +310,15 @@ impl Volume {
         } else {
             Vec::new()
         };
+        self.create_inode_content(id, kind, metadata, content).await
+    }
+    async fn create_inode_content(
+        &self,
+        id: [u8; 16],
+        kind: u8,
+        metadata: crate::format::metadata::Metadata,
+        content: Vec<u8>,
+    ) -> Result<Loaded> {
         let mut loaded = Loaded {
             body: InodeBody {
                 id,
@@ -306,6 +326,10 @@ impl Volume {
                 generation: 0,
                 metadata,
                 lease: None,
+                deleted: false,
+                nlink: if kind == inode::DIRECTORY { 2 } else { 1 },
+
+                mutations: vec![],
                 content: InodeContent::Inline(content),
                 extensions: vec![],
             },
@@ -318,6 +342,9 @@ impl Volume {
     }
     pub async fn list(&self, id: [u8; 16]) -> Result<Vec<Entry>> {
         let loaded = self.load(id).await?;
+        if loaded.body.deleted {
+            return Err(Error::Missing);
+        }
         if loaded.body.kind != inode::DIRECTORY {
             return Err(Error::NotDirectory);
         }
@@ -326,107 +353,46 @@ impl Volume {
         };
         Ok(Directory::decode(&bytes)?.entries)
     }
-    /// Merge only directory entry edits against the latest ETag, never file contents.
-    async fn edit_directory(
-        &self,
-        parent: [u8; 16],
-        name: &str,
-        entry: Option<Entry>,
-    ) -> Result<()> {
-        for _ in 0..16 {
-            let loaded = self.load_writable(parent).await?;
-            if loaded.body.kind != inode::DIRECTORY {
-                return Err(Error::NotDirectory);
-            }
-            let InodeContent::Inline(bytes) = &loaded.body.content else {
-                return Err(Error::Invalid);
-            };
-            let mut directory = Directory::decode(bytes)?;
-            let position = directory.entries.iter().position(|e| e.name == name);
-            match (&entry, position) {
-                (Some(_), Some(_)) => return Err(Error::Exists),
-                (Some(e), None) => directory.entries.push(e.clone()),
-                (None, Some(i)) => {
-                    directory.entries.remove(i);
-                }
-                (None, None) => return Err(Error::Missing),
-            }
-            directory.entries.sort_by(|a, b| a.name.cmp(&b.name));
-            let mut body = loaded.body.clone();
-            body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
-            body.content = InodeContent::Inline(directory.encode()?);
-            body.metadata.mtime = crate::format::metadata::Timestamp::now();
-            body.metadata.ctime = body.metadata.mtime;
-            match self.publish(&loaded, &body, Some(&loaded.etag)).await {
-                Ok(_) => return Ok(()),
-                Err(Error::Conflict) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(Error::Conflict)
-    }
-    pub async fn create(&self, parent: [u8; 16], name: &str, kind: u8) -> Result<Loaded> {
-        self.create_with_metadata(
-            parent,
-            name,
-            kind,
-            crate::format::metadata::Metadata::new(
-                0,
-                0,
-                if kind == inode::DIRECTORY {
-                    0o755
-                } else {
-                    0o644
-                },
-            ),
-        )
-        .await
-    }
-    pub async fn create_with_metadata(
-        &self,
-        parent: [u8; 16],
-        name: &str,
-        kind: u8,
-        metadata: crate::format::metadata::Metadata,
-    ) -> Result<Loaded> {
-        // Validate before creating an orphan object on invalid names.
-        Directory {
-            entries: vec![Entry {
-                name: name.into(),
-                id: [0; 16],
-                kind,
-            }],
-        }
-        .encode()?;
-        let loaded = self
-            .create_inode(crypto::random_array()?, kind, metadata)
-            .await?;
-        self.edit_directory(
-            parent,
-            name,
-            Some(Entry {
-                name: name.into(),
-                id: loaded.body.id,
-                kind,
-            }),
-        )
-        .await?;
-        Ok(loaded)
-    }
     pub async fn update_metadata(
         &self,
         id: [u8; 16],
         update: &MetadataUpdate,
         actor: (u32, u32),
     ) -> Result<Loaded> {
+        let baseline = self.load(id).await?;
+        let desired = update.apply(&baseline.body.metadata, actor)?;
         for _ in 0..16 {
-            let mut loaded = self.load_writable(id).await?;
+            let mut loaded = match self.load_writable(id).await {
+                Ok(l) => l,
+                Err(Error::Conflict) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if update.is_empty() {
                 return Ok(loaded);
             }
             let mut body = loaded.body.clone();
-            body.metadata = update.apply(&body.metadata, actor)?;
+            update.apply(&body.metadata, actor)?;
+            let different = update.different_fields(&desired, &body.metadata);
+            if body.mutations.iter().any(|m| {
+                m.generation > baseline.body.generation && m.attribute_fields & different != 0
+            }) {
+                return Err(Error::Conflict);
+            }
+            body.metadata = update.rebase(&baseline.body.metadata, &body.metadata, &desired)?;
             body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
+            let generation = body.generation;
+            record_mutation(
+                &mut body,
+                inode::Mutation {
+                    generation,
+                    size_changed: false,
+                    attribute_fields: update.fields(),
+                    ranges: vec![],
+                },
+            )?;
             match self.publish(&loaded, &body, Some(&loaded.etag)).await {
                 Ok(etag) => {
                     loaded.body = body;
@@ -439,21 +405,9 @@ impl Volume {
         }
         Err(Error::Conflict)
     }
-    pub async fn unlink(&self, parent: [u8; 16], name: &str) -> Result<()> {
-        let entries = self.list(parent).await?;
-        let entry = entries
-            .iter()
-            .find(|e| e.name == name)
-            .ok_or(Error::Missing)?;
-        // rmdir requires a stronger namespace transaction; not offered by this prototype.
-        if entry.kind == inode::DIRECTORY {
-            return Err(Error::NotDirectory);
-        }
-        self.edit_directory(parent, name, None).await
-    }
     pub fn file(self: &Arc<Self>, loaded: Loaded, cache_dir: &Path) -> Result<FileSession> {
         if loaded.body.kind != inode::FILE {
-            return Err(Error::NotDirectory);
+            return Err(Error::IsDirectory);
         }
         std::fs::create_dir_all(cache_dir)?;
         let path = cache_dir.join(format!(
@@ -480,4 +434,54 @@ impl Volume {
             cache_dir.to_owned(),
         ))
     }
+}
+
+/// Compact last-writer versions, not a bounded-age history. Old handles can
+/// still merge untouched ranges after arbitrarily many unrelated commits.
+fn record_mutation(body: &mut InodeBody, mut next: inode::Mutation) -> Result<()> {
+    next.ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in next.ranges {
+        if let Some(last) = merged.last_mut()
+            && a <= last.1
+        {
+            last.1 = last.1.max(b);
+        } else {
+            merged.push((a, b));
+        }
+    }
+    next.ranges = merged;
+    for old in &mut body.mutations {
+        if next.size_changed {
+            old.size_changed = false;
+        }
+        old.attribute_fields &= !next.attribute_fields;
+        let mut remaining = Vec::new();
+        for &(a, b) in &old.ranges {
+            let mut cursor = a;
+            let first = next.ranges.partition_point(|&(_, end)| end <= a);
+            for &(x, y) in &next.ranges[first..] {
+                if x >= b {
+                    break;
+                }
+                if cursor < x {
+                    remaining.push((cursor, x));
+                }
+                cursor = cursor.max(y).min(b);
+            }
+            if cursor < b {
+                remaining.push((cursor, b));
+            }
+        }
+        old.ranges = remaining;
+    }
+    body.mutations
+        .retain(|m| !m.ranges.is_empty() || m.size_changed || m.attribute_fields != 0);
+    body.mutations.push(next);
+    if body.mutations.len() > inode::MAX_MUTATIONS
+        || body.mutations.iter().map(|m| m.ranges.len()).sum::<usize>() > 65536
+    {
+        return Err(Error::TooLarge);
+    }
+    Ok(())
 }

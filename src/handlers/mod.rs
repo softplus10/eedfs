@@ -174,6 +174,46 @@ impl Filesystem for S3Filesystem {
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         self.handle_unlink(_req, parent, name, reply)
     }
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.handle_rmdir(parent, name, reply)
+    }
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        _owner: Option<Owner>,
+        reply: ReplyEmpty,
+    ) {
+        self.handle_rename(parent, name, newparent, newname, flags, reply)
+    }
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        self.handle_link(ino, newparent, newname, reply)
+    }
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        target: &std::path::Path,
+        owner: Owner,
+        reply: ReplyEntry,
+    ) {
+        self.handle_symlink(parent, name, target, owner, reply)
+    }
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        self.handle_readlink(ino, reply)
+    }
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         self.handle_opendir(_req, ino, _flags, reply)
     }

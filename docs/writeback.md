@@ -2,7 +2,7 @@
 
 This document fixes the current write/fsync/append/error/close contract. The selected [concurrency and metadata policies](concurrency-and-metadata.md)
 extend this contract. Namespace transactions and GC remain separate work.
-Inode v5 stores ownership, permissions and timestamps.
+Inode v6 stores ownership, permissions and timestamps.
 
 ## write
 

@@ -28,6 +28,7 @@ struct State {
     gate: Condvar,
     deny_chunks: AtomicBool,
     deny_inode: AtomicBool,
+    deny_put_once: Mutex<Option<(String, usize)>>,
     started: AtomicUsize,
     completed: AtomicUsize,
     serial: AtomicUsize,
@@ -51,6 +52,7 @@ impl Server {
             gate: Condvar::new(),
             deny_chunks: AtomicBool::new(false),
             deny_inode: AtomicBool::new(false),
+            deny_put_once: Mutex::new(None),
             started: AtomicUsize::new(0),
             completed: AtomicUsize::new(0),
             serial: AtomicUsize::new(0),
@@ -114,6 +116,10 @@ impl Server {
                 generation: 0,
                 metadata: Default::default(),
                 lease: None,
+                deleted: false,
+                nlink: 1,
+
+                mutations: vec![],
                 content: InodeContent::Inline(vec![]),
                 extensions: vec![],
             },
@@ -185,7 +191,26 @@ fn serve(mut stream: TcpStream, s: &State) -> std::io::Result<()> {
                     gate = s.gate.wait(gate).unwrap();
                 }
             }
-            if (!is_inode && s.deny_chunks.load(Ordering::SeqCst))
+            let forced = {
+                let mut rule = s.deny_put_once.lock().unwrap();
+                if let Some((wanted, left)) = rule.as_mut() {
+                    if wanted == &key {
+                        *left -= 1;
+                        if *left == 0 {
+                            *rule = None;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if forced
+                || (!is_inode && s.deny_chunks.load(Ordering::SeqCst))
                 || (is_inode && s.deny_inode.load(Ordering::SeqCst))
             {
                 (
@@ -703,4 +728,363 @@ async fn ordinary_edit_retires_expired_lease_and_acquisition_race_has_one_winner
             .await,
         Err(Error::Invalid)
     ));
+}
+
+#[tokio::test]
+async fn sparse_extents_do_not_upload_zero_objects_and_survive_split_shrink_extend() {
+    let server = Server::new();
+    let (v, mut f) = server.file().await;
+    let id = f.base.body.id;
+    let before = server.state.started.load(Ordering::SeqCst);
+    f.resize(1 << 34).unwrap();
+    f.commit().await.unwrap();
+    assert_eq!(server.state.started.load(Ordering::SeqCst), before);
+    let InodeContent::Chunks(c) = &f.base.body.content else {
+        panic!()
+    };
+    assert!(c.runs.is_empty());
+    assert_eq!(c.holes.len(), 1);
+    let mut f = v.file(v.load(id).await.unwrap(), &server.cache).unwrap();
+    assert_eq!(f.read((1 << 34) - 16, 16).await.unwrap(), vec![0; 16]);
+    f.write(1 << 33, b"middle").await.unwrap();
+    f.commit().await.unwrap();
+    assert_eq!(server.state.started.load(Ordering::SeqCst), before + 1);
+    assert_eq!(
+        f.read((1 << 33) - 3, 12).await.unwrap(),
+        b"\0\0\0middle\0\0\0"
+    );
+    f.resize(1 << 32).unwrap();
+    f.commit().await.unwrap();
+    f.resize(1 << 34).unwrap();
+    f.commit().await.unwrap();
+    assert_eq!(f.read(1 << 33, 6).await.unwrap(), vec![0; 6]);
+    assert_eq!(server.state.started.load(Ordering::SeqCst), before + 1);
+}
+
+#[tokio::test]
+async fn shrink_merges_prefix_edits_but_conflicts_with_removed_bytes_and_append() {
+    let server = Server::new();
+    let (v, mut seed) = server.file().await;
+    seed.write(0, &vec![3; 300_000]).await.unwrap();
+    seed.commit().await.unwrap();
+    let base = seed.base.clone();
+    let mut truncate = v.file(base.clone(), &server.cache).unwrap();
+    let mut prefix = v.file(base.clone(), &server.cache).unwrap();
+    truncate.resize(200_000).unwrap();
+    prefix.write(10, b"prefix").await.unwrap();
+    prefix.commit().await.unwrap();
+    truncate.commit().await.unwrap();
+    assert_eq!(truncate.size, 200_000);
+    assert_eq!(truncate.read(10, 6).await.unwrap(), b"prefix");
+    let mut old = v.file(base.clone(), &server.cache).unwrap();
+    old.write(250_000, b"gone").await.unwrap();
+    assert!(matches!(old.commit().await, Err(Error::Conflict)));
+    let base = truncate.base.clone();
+    let mut a = v.file(base.clone(), &server.cache).unwrap();
+    let mut b = v.file(base, &server.cache).unwrap();
+    a.resize(100_000).unwrap();
+    b.write(200_000, b"append").await.unwrap();
+    a.commit().await.unwrap();
+    assert!(matches!(b.commit().await, Err(Error::Conflict)));
+    let mut a = v.file(a.base.clone(), &server.cache).unwrap();
+    let mut b = v.file(a.base.clone(), &server.cache).unwrap();
+    a.resize(90_000).unwrap();
+    b.resize(80_000).unwrap();
+    b.commit().await.unwrap();
+    assert!(matches!(a.commit().await, Err(Error::Conflict)));
+}
+
+#[tokio::test]
+async fn equal_byte_and_aba_writes_still_conflict_and_metadata_equal_values_succeed() {
+    let server = Server::new();
+    let (v, mut seed) = server.file().await;
+    seed.write(0, b"abcdef").await.unwrap();
+    seed.commit().await.unwrap();
+    let mut a = v.file(seed.base.clone(), &server.cache).unwrap();
+    let mut b = v.file(seed.base.clone(), &server.cache).unwrap();
+    a.write(0, b"a").await.unwrap();
+    b.write(0, b"a").await.unwrap();
+    a.commit().await.unwrap();
+    assert!(matches!(b.commit().await, Err(Error::Conflict)));
+    let mut stale = v.file(a.base.clone(), &server.cache).unwrap();
+    stale.write(1, b"Z").await.unwrap();
+    a.write(1, b"X").await.unwrap();
+    a.commit().await.unwrap();
+    a.write(1, b"b").await.unwrap();
+    a.commit().await.unwrap();
+    assert!(matches!(stale.commit().await, Err(Error::Conflict)));
+    let mut a = v.file(a.base.clone(), &server.cache).unwrap();
+    let mut b = v.file(a.base.clone(), &server.cache).unwrap();
+    let update = MetadataUpdate {
+        mode: Some(0o600),
+        ..Default::default()
+    };
+    a.update_metadata(&update, (0, 0)).unwrap();
+    b.update_metadata(&update, (0, 0)).unwrap();
+    a.commit().await.unwrap();
+    b.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn namespace_links_rename_replacement_symlink_and_deleted_directory() {
+    let server = Server::new();
+    let (v, _) = server.file().await;
+    v.create_inode(v.root, inode::DIRECTORY, Default::default())
+        .await
+        .unwrap();
+    let a = v
+        .create(v.root, "a", inode::DIRECTORY)
+        .await
+        .unwrap()
+        .body
+        .id;
+    let b = v
+        .create(v.root, "b", inode::DIRECTORY)
+        .await
+        .unwrap()
+        .body
+        .id;
+    let file = v.create(a, "file", inode::FILE).await.unwrap();
+    let mut open = v.file(file.clone(), &server.cache).unwrap();
+    open.write(0, b"old snapshot").await.unwrap();
+    open.commit().await.unwrap();
+    v.link(file.body.id, b, "alias").await.unwrap();
+    assert_eq!(v.load(file.body.id).await.unwrap().body.nlink, 2);
+    v.unlink(a, "file").await.unwrap();
+    assert_eq!(v.load(file.body.id).await.unwrap().body.nlink, 1);
+    assert_eq!(open.read(0, 12).await.unwrap(), b"old snapshot");
+    v.unlink(b, "alias").await.unwrap();
+    open.write(0, b"new").await.unwrap();
+    open.commit().await.unwrap();
+    assert_eq!(open.base.body.nlink, 0);
+    assert!(v.list(b).await.unwrap().is_empty());
+    let source = v.create(a, "source", inode::FILE).await.unwrap();
+    let target = v.create(b, "target", inode::FILE).await.unwrap();
+    assert!(matches!(
+        v.rename(a, "source", b, "target", true).await,
+        Err(Error::Exists)
+    ));
+    v.rename(a, "source", b, "target", false).await.unwrap();
+    assert!(v.list(a).await.unwrap().is_empty());
+    assert_eq!(v.list(b).await.unwrap()[0].id, source.body.id);
+    assert_eq!(v.load(target.body.id).await.unwrap().body.nlink, 0);
+    v.rename(b, "target", b, "renamed", false).await.unwrap();
+    let sym = v
+        .symlink(a, "sym", b"../b/renamed", Default::default())
+        .await
+        .unwrap();
+    assert_eq!(v.readlink(sym.body.id).await.unwrap(), b"../b/renamed");
+    assert!(matches!(v.rmdir(v.root, "a").await, Err(Error::NotEmpty)));
+    v.unlink(a, "sym").await.unwrap();
+    v.rmdir(v.root, "a").await.unwrap();
+    assert!(v.load(a).await.unwrap().body.deleted);
+    assert!(matches!(
+        v.create(a, "resurrect", inode::FILE).await,
+        Err(Error::Missing)
+    ));
+    let c = v.create(b, "c", inode::DIRECTORY).await.unwrap().body.id;
+    assert!(matches!(
+        v.rename(v.root, "b", c, "cycle", false).await,
+        Err(Error::Invalid)
+    ));
+    let d = v
+        .create(v.root, "d", inode::DIRECTORY)
+        .await
+        .unwrap()
+        .body
+        .id;
+    v.rename(b, "c", v.root, "d", false).await.unwrap();
+    assert!(v.load(d).await.unwrap().body.deleted);
+}
+
+#[tokio::test]
+async fn interrupted_rename_leaves_both_names_and_rmdir_never_resurrects() {
+    let server = Server::new();
+    let (v, _) = server.file().await;
+    v.create_inode(v.root, inode::DIRECTORY, Default::default())
+        .await
+        .unwrap();
+    let a = v
+        .create(v.root, "a", inode::DIRECTORY)
+        .await
+        .unwrap()
+        .body
+        .id;
+    let b = v
+        .create(v.root, "b", inode::DIRECTORY)
+        .await
+        .unwrap()
+        .body
+        .id;
+    let source = v.create(a, "source", inode::FILE).await.unwrap();
+    *server.state.deny_put_once.lock().unwrap() = Some((v.inode_name(&a).unwrap(), 2));
+    assert!(v.rename(a, "source", b, "target", false).await.is_err());
+    assert_eq!(v.list(a).await.unwrap()[0].id, source.body.id);
+    assert_eq!(v.list(b).await.unwrap()[0].id, source.body.id);
+    v.unlink(a, "source").await.unwrap();
+    v.unlink(b, "target").await.unwrap();
+    let empty = v
+        .create(v.root, "empty", inode::DIRECTORY)
+        .await
+        .unwrap()
+        .body
+        .id;
+    *server.state.deny_put_once.lock().unwrap() = Some((v.inode_name(&v.root).unwrap(), 2));
+    assert!(v.rmdir(v.root, "empty").await.is_err());
+    assert!(v.load(empty).await.unwrap().body.deleted);
+    assert!(matches!(
+        v.create(empty, "hidden", inode::FILE).await,
+        Err(Error::Missing)
+    ));
+}
+
+#[tokio::test]
+async fn competing_directory_moves_cannot_make_a_cycle_and_disjoint_entries_survive() {
+    let server = Server::new();
+    let (v, _) = server.file().await;
+    v.create_inode(v.root, inode::DIRECTORY, Default::default())
+        .await
+        .unwrap();
+    let a = v
+        .create(v.root, "a", inode::DIRECTORY)
+        .await
+        .unwrap()
+        .body
+        .id;
+    let b = v
+        .create(v.root, "b", inode::DIRECTORY)
+        .await
+        .unwrap()
+        .body
+        .id;
+    let (left, right) = tokio::join!(
+        v.rename(v.root, "a", b, "a", false),
+        v.rename(v.root, "b", a, "b", false)
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let (a, b, c) = tokio::join!(
+        v.create(v.root, "one", inode::FILE),
+        v.create(v.root, "two", inode::FILE),
+        v.create(v.root, "three", inode::FILE)
+    );
+    assert!(a.is_ok() && b.is_ok() && c.is_ok());
+    let (a, b) = tokio::join!(
+        v.create(v.root, "same", inode::FILE),
+        v.create(v.root, "same", inode::FILE)
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+}
+
+#[tokio::test]
+async fn old_handle_merges_after_many_commits_and_metadata_aba_is_detected() {
+    let server = Server::new();
+    let (v, mut current) = server.file().await;
+    current.write(0, &[0; 128]).await.unwrap();
+    current.commit().await.unwrap();
+    let mut stale = v.file(current.base.clone(), &server.cache).unwrap();
+    stale.write(0, b"X").await.unwrap();
+    for i in 1..=70 {
+        current.write(i, &[i as u8]).await.unwrap();
+        current.commit().await.unwrap();
+    }
+    stale.commit().await.unwrap();
+    assert_eq!(stale.read(0, 2).await.unwrap(), b"X\x01");
+    let mut stale = v.file(stale.base.clone(), &server.cache).unwrap();
+    stale
+        .update_metadata(
+            &MetadataUpdate {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+            (0, 0),
+        )
+        .unwrap();
+    v.update_metadata(
+        stale.base.body.id,
+        &MetadataUpdate {
+            mode: Some(0o700),
+            ..Default::default()
+        },
+        (0, 0),
+    )
+    .await
+    .unwrap();
+    v.update_metadata(
+        stale.base.body.id,
+        &MetadataUpdate {
+            mode: Some(0o644),
+            ..Default::default()
+        },
+        (0, 0),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(stale.commit().await, Err(Error::Conflict)));
+    let base = v.load(stale.base.body.id).await.unwrap();
+    let mut equal = v.file(base, &server.cache).unwrap();
+    equal
+        .update_metadata(
+            &MetadataUpdate {
+                mode: Some(0o644),
+                ..Default::default()
+            },
+            (0, 0),
+        )
+        .unwrap();
+    v.update_metadata(
+        equal.base.body.id,
+        &MetadataUpdate {
+            mode: Some(0o600),
+            ..Default::default()
+        },
+        (0, 0),
+    )
+    .await
+    .unwrap();
+    v.update_metadata(
+        equal.base.body.id,
+        &MetadataUpdate {
+            mode: Some(0o644),
+            ..Default::default()
+        },
+        (0, 0),
+    )
+    .await
+    .unwrap();
+    equal.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn create_racing_rmdir_never_publishes_an_unreachable_child() {
+    let server = Server::new();
+    let (v, _) = server.file().await;
+    v.create_inode(v.root, inode::DIRECTORY, Default::default())
+        .await
+        .unwrap();
+    for i in 0..12 {
+        let name = format!("dir-{i}");
+        let d = v
+            .create(v.root, &name, inode::DIRECTORY)
+            .await
+            .unwrap()
+            .body
+            .id;
+        let (removed, created) =
+            tokio::join!(v.rmdir(v.root, &name), v.create(d, "child", inode::FILE));
+        assert_ne!(removed.is_ok(), created.is_ok());
+        if created.is_ok() {
+            assert!(!v.load(d).await.unwrap().body.deleted);
+            v.unlink(d, "child").await.unwrap();
+            v.rmdir(v.root, &name).await.unwrap();
+        } else {
+            assert!(v.load(d).await.unwrap().body.deleted);
+        }
+    }
+    let f = v.create(v.root, "same-path", inode::FILE).await.unwrap();
+    assert!(matches!(
+        v.rename(v.root, "same-path", v.root, "same-path", true)
+            .await,
+        Err(Error::Exists)
+    ));
+    assert_eq!(v.load(f.body.id).await.unwrap().body.nlink, 1);
 }

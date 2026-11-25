@@ -4,7 +4,7 @@ use crate::{
     crypto::{self, naming, objects},
     format::{
         header::NamingConfig,
-        inode::{self, ChunkRun, ChunkedContent, InodeContent},
+        inode::{self, ChunkRun, ChunkedContent, Hole, InodeContent, Mutation},
         metadata::{Metadata, Timestamp},
     },
     storage::s3::PutResult,
@@ -48,6 +48,8 @@ pub struct FileSession {
     ranges: Vec<(u64, u64)>,
     append_generation: bool,
     resized: bool,
+    holes: Vec<(u64, u64)>,
+    resize_ranges: Vec<(u64, u64)>,
 }
 impl FileSession {
     pub(super) fn new(
@@ -58,6 +60,14 @@ impl FileSession {
         cache_dir: PathBuf,
     ) -> Self {
         let metadata = base.body.metadata.clone();
+        let holes = match &base.body.content {
+            InodeContent::Chunks(c) => c
+                .holes
+                .iter()
+                .map(|h| (h.offset, h.offset + h.len))
+                .collect(),
+            _ => vec![],
+        };
         Self {
             volume,
             base,
@@ -80,6 +90,8 @@ impl FileSession {
             ranges: Vec::new(),
             append_generation: false,
             resized: false,
+            holes,
+            resize_ranges: vec![],
         }
     }
     async fn ensure(&mut self, start: u64, end: u64) -> Result<()> {
@@ -160,6 +172,10 @@ impl FileSession {
             return Err(Error::TooLarge);
         }
         self.ensure(offset, end).await?;
+        if offset > self.size {
+            self.add_hole(self.size, offset);
+        }
+        self.remove_hole(offset, end);
         self.file.write_all_at(bytes, offset)?;
         for (i, p) in pieces(&self.base.body).iter().enumerate() {
             if p.offset < end && p.offset + u64::from(p.len) > offset {
@@ -198,11 +214,45 @@ impl FileSession {
         Ok(bytes.len())
     }
     fn check_size(&self, size: u64) -> Result<()> {
-        if size.div_ceil(self.volume.chunk_size as u64) > inode::MAX_CHUNK_REFERENCES as u64 {
+        if size > i64::MAX as u64 {
             Err(Error::TooLarge)
         } else {
             Ok(())
         }
+    }
+    fn add_hole(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        self.holes.push((start, end));
+        self.holes.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (a, b) in self.holes.drain(..) {
+            if let Some(last) = merged.last_mut()
+                && a <= last.1
+            {
+                last.1 = last.1.max(b);
+            } else {
+                merged.push((a, b));
+            }
+        }
+        self.holes = merged;
+    }
+    fn remove_hole(&mut self, start: u64, end: u64) {
+        let mut next = Vec::new();
+        for &(a, b) in &self.holes {
+            if b <= start || a >= end {
+                next.push((a, b));
+                continue;
+            }
+            if a < start {
+                next.push((a, start));
+            }
+            if end < b {
+                next.push((end, b));
+            }
+        }
+        self.holes = next;
     }
     pub fn resize(&mut self, size: u64) -> Result<()> {
         self.check_size(size)?;
@@ -210,6 +260,18 @@ impl FileSession {
             return Ok(());
         }
         self.file.set_len(size)?;
+        self.resize_ranges
+            .push((self.size.min(size), self.size.max(size)));
+        if size > self.size {
+            self.add_hole(self.size, size);
+        } else {
+            self.remove_hole(size, u64::MAX);
+            self.ranges = self
+                .ranges
+                .iter()
+                .filter_map(|&(a, b)| (a < size).then_some((a, b.min(size))))
+                .collect();
+        }
         self.visible_size = self.visible_size.min(size);
         self.staged
             .retain(|_, s| s.piece.offset + u64::from(s.piece.len) <= size);
@@ -281,13 +343,20 @@ impl FileSession {
         result
     }
     fn gaps(&self) -> Vec<(u64, u64)> {
+        let mut covered: Vec<_> = self
+            .reusable()
+            .into_iter()
+            .map(|p| (p.offset, p.offset + u64::from(p.len)))
+            .collect();
+        covered.extend(self.holes.iter().copied());
+        covered.sort_unstable();
         let mut cursor = 0;
         let mut gaps = Vec::new();
-        for p in self.reusable() {
-            if cursor < p.offset {
-                gaps.push((cursor, p.offset));
+        for (a, b) in covered {
+            if cursor < a {
+                gaps.push((cursor, a));
             }
-            cursor = p.offset + u64::from(p.len);
+            cursor = cursor.max(b);
         }
         if cursor < self.size {
             gaps.push((cursor, self.size));
@@ -400,6 +469,9 @@ impl FileSession {
             self.changed = true;
         }
     }
+    pub fn allocated_size(&self) -> u64 {
+        self.size - self.holes.iter().map(|(a, b)| b - a).sum::<u64>()
+    }
     pub fn is_dirty(&self) -> bool {
         self.changed
     }
@@ -419,7 +491,7 @@ impl FileSession {
         for _ in 0..16 {
             match self.commit_once().await {
                 Ok(()) => return Ok(()),
-                Err(Error::Conflict) if !self.resized => {
+                Err(Error::Conflict) => {
                     let candidate = self.rebase().await?;
                     *self = candidate;
                 }
@@ -432,8 +504,34 @@ impl FileSession {
         let latest = self.volume.load(self.base.body.id).await?;
         let original_size = self.base.body.size()?;
         let latest_size = latest.body.size()?;
-        if (self.append_generation && latest_size != original_size)
-            || (!self.ranges.is_empty() && latest_size < original_size)
+        let different_fields = self
+            .attributes
+            .different_fields(&self.metadata, &latest.body.metadata);
+        let local: Vec<_> = self
+            .ranges
+            .iter()
+            .chain(&self.resize_ranges)
+            .copied()
+            .collect();
+        for mutation in latest
+            .body
+            .mutations
+            .iter()
+            .filter(|m| m.generation > self.base.body.generation)
+        {
+            if (mutation.attribute_fields & different_fields != 0)
+                || ((self.resized || self.append_generation) && mutation.size_changed)
+                || mutation
+                    .ranges
+                    .iter()
+                    .any(|&(a, b)| local.iter().any(|&(x, y)| a < y && x < b))
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        if !self.resized
+            && self.ranges.iter().any(|&(_, b)| b > latest_size)
+            && !self.append_generation
         {
             return Err(Error::Conflict);
         }
@@ -449,9 +547,16 @@ impl FileSession {
             &self.metadata,
         )?;
         let mut original = self.volume.file(self.base.clone(), &self.cache_dir)?;
+        let mut remote = self.volume.file(latest.clone(), &self.cache_dir)?;
         let mut candidate = self.volume.file(latest, &self.cache_dir)?;
+        if self.resized {
+            if self.visible_size < original_size {
+                candidate.resize(self.visible_size)?;
+            }
+            candidate.resize(self.size)?;
+        }
         for &(start, end) in &self.ranges {
-            if end > candidate.size && !self.append_generation {
+            if end > candidate.size && !self.append_generation && !self.resized {
                 return Err(Error::Conflict);
             }
             let mut offset = start;
@@ -460,7 +565,7 @@ impl FileSession {
                 let comparable = original_size.saturating_sub(offset).min(len as u64) as usize;
                 if comparable > 0
                     && original.read(offset, comparable).await?
-                        != candidate.read(offset, comparable).await?
+                        != remote.read(offset, comparable).await?
                 {
                     return Err(Error::Conflict);
                 }
@@ -475,6 +580,9 @@ impl FileSession {
             candidate.metadata.mtime = Timestamp::now();
         }
         candidate.metadata.ctime = Timestamp::now();
+        candidate.resize_ranges = self.resize_ranges.clone();
+        candidate.resized = self.resized;
+        candidate.append_generation = self.append_generation;
         candidate.attributes = self.attributes.clone();
         candidate.attributes_actor = self.attributes_actor;
         candidate.changed = true;
@@ -497,6 +605,7 @@ impl FileSession {
         let content = if self.size <= inode::MAX_INLINE_SIZE as u64 {
             InodeContent::Inline(self.read(0, self.size as usize).await?)
         } else {
+            self.ensure_naming()?;
             let next = self.reusable();
             if next.len() > inode::MAX_CHUNK_REFERENCES {
                 return Err(Error::TooLarge);
@@ -505,10 +614,10 @@ impl FileSession {
             let mut cursor = 0;
             let mut runs: Vec<ChunkRun> = Vec::new();
             for p in next {
-                if p.offset != cursor {
+                if p.offset < cursor {
                     return Err(Error::Invalid);
                 }
-                cursor += u64::from(p.len);
+                cursor = p.offset + u64::from(p.len);
                 if let Some(last) = runs.last_mut()
                     && last.allocation_id == p.allocation
                     && last.first_chunk + last.plaintext_lengths.len() as u64 == p.index
@@ -522,7 +631,7 @@ impl FileSession {
                     plaintext_lengths: vec![p.len],
                 });
             }
-            if cursor != self.size || self.staged.values().any(|s| !s.ready) {
+            if cursor > self.size || self.staged.values().any(|s| !s.ready) {
                 return Err(Error::Invalid);
             }
             let naming = match &self.naming {
@@ -532,12 +641,45 @@ impl FileSession {
                     _ => return Err(Error::Invalid),
                 },
             };
-            InodeContent::Chunks(ChunkedContent { naming, runs })
+            let chunks = ChunkedContent {
+                naming,
+                runs,
+                holes: self
+                    .holes
+                    .iter()
+                    .map(|&(a, b)| Hole {
+                        offset: a,
+                        len: b - a,
+                    })
+                    .collect(),
+            };
+            if chunks.size()? != self.size {
+                return Err(Error::Invalid);
+            }
+            InodeContent::Chunks(chunks)
         };
         let mut body = self.base.body.clone();
         body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
         body.content = content;
         body.metadata = self.metadata.clone();
+        let mut ranges = self.ranges.clone();
+        ranges.extend(self.resize_ranges.iter().copied());
+        if !ranges.is_empty() || !self.attributes.is_empty() {
+            super::record_mutation(
+                &mut body,
+                Mutation {
+                    generation: self
+                        .base
+                        .body
+                        .generation
+                        .checked_add(1)
+                        .ok_or(Error::TooLarge)?,
+                    size_changed: self.resized || self.append_generation,
+                    attribute_fields: self.attributes.fields(),
+                    ranges,
+                },
+            )?;
+        }
         let etag = self
             .volume
             .publish(&self.base, &body, Some(&self.base.etag))
@@ -557,6 +699,7 @@ impl FileSession {
         self.attributes_actor = None;
         self.append_generation = false;
         self.resized = false;
+        self.resize_ranges.clear();
         Ok(())
     }
 }

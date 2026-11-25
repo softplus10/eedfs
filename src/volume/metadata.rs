@@ -10,6 +10,32 @@ pub struct MetadataUpdate {
     pub mtime: Option<Timestamp>,
 }
 impl MetadataUpdate {
+    pub(super) fn fields(&self) -> u8 {
+        u8::from(self.mode.is_some())
+            | (u8::from(self.uid.is_some()) << 1)
+            | (u8::from(self.gid.is_some()) << 2)
+            | (u8::from(self.atime.is_some()) << 3)
+            | (u8::from(self.mtime.is_some()) << 4)
+    }
+    pub(super) fn different_fields(&self, desired: &Metadata, latest: &Metadata) -> u8 {
+        let mut different = 0;
+        if self.mode.is_some() && desired.mode != latest.mode {
+            different |= 1;
+        }
+        if self.uid.is_some() && desired.uid != latest.uid {
+            different |= 2;
+        }
+        if self.gid.is_some() && desired.gid != latest.gid {
+            different |= 4;
+        }
+        if self.atime.is_some() && desired.atime != latest.atime {
+            different |= 8;
+        }
+        if self.mtime.is_some() && desired.mtime != latest.mtime {
+            different |= 16;
+        }
+        different
+    }
     pub fn is_empty(&self) -> bool {
         self.mode.is_none()
             && self.uid.is_none()
@@ -89,6 +115,9 @@ impl MetadataUpdate {
         field!(gid);
         field!(atime);
         field!(mtime);
+        if self.uid.is_some() || self.gid.is_some() {
+            next.mode &= !0o6000;
+        }
         next.ctime = Timestamp::now();
         Ok(next)
     }

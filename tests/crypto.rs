@@ -87,6 +87,7 @@ fn password_header_inode_chunk_and_sharing_roundtrip_with_cow() {
                 algorithm: naming::algorithm().unwrap(),
                 key: crypto::random_array().unwrap(),
             },
+            holes: vec![],
             runs: vec![ChunkRun {
                 allocation_id: crypto::random_array().unwrap(),
                 first_chunk: 10,
@@ -113,6 +114,10 @@ fn password_header_inode_chunk_and_sharing_roundtrip_with_cow() {
             generation: 1,
             metadata: Default::default(),
             lease: None,
+            deleted: false,
+            nlink: 1,
+
+            mutations: vec![],
             content: InodeContent::Chunks(config),
             extensions: vec![],
         };

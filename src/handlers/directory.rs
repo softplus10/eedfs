@@ -59,7 +59,14 @@ impl S3Filesystem {
                     kind: inode::DIRECTORY,
                 },
             );
-            self.attr(ino, inode::DIRECTORY, 0, &loaded.body.metadata)
+            self.attr(
+                ino,
+                inode::DIRECTORY,
+                0,
+                &loaded.body.metadata,
+                loaded.body.nlink,
+                allocation_size(&loaded.body),
+            )
         })();
         match result {
             Ok(a) => reply.entry(&TTL, &a, Generation(0)),
@@ -85,6 +92,114 @@ impl S3Filesystem {
             Err(e) => reply.error(errno(e)),
         }
     }
+    pub(super) fn handle_rmdir(&self, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let result = (|| {
+            self.runtime.block_on(
+                self.volume
+                    .rmdir(self.node(parent)?.id, name.to_str().ok_or(Error::Invalid)?),
+            )
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+    pub(super) fn handle_rename(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let result = (|| {
+            if flags.bits() & !libc::RENAME_NOREPLACE != 0 {
+                return Err(Error::Unsupported);
+            }
+            self.runtime.block_on(self.volume.rename(
+                self.node(parent)?.id,
+                name.to_str().ok_or(Error::Invalid)?,
+                self.node(newparent)?.id,
+                newname.to_str().ok_or(Error::Invalid)?,
+                flags.bits() != 0,
+            ))
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+    pub(super) fn handle_link(
+        &self,
+        ino: INodeNo,
+        parent: INodeNo,
+        name: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let result = (|| {
+            let l = self.runtime.block_on(self.volume.link(
+                self.node(ino)?.id,
+                self.node(parent)?.id,
+                name.to_str().ok_or(Error::Invalid)?,
+            ))?;
+            let number = self.register(
+                parent,
+                &Entry {
+                    name: name.to_str().ok_or(Error::Invalid)?.into(),
+                    id: l.body.id,
+                    kind: l.body.kind,
+                },
+            );
+            self.getattr_inner(number)
+        })();
+        match result {
+            Ok(a) => reply.entry(&TTL, &a, Generation(0)),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+    pub(super) fn handle_symlink(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+        target: &std::path::Path,
+        owner: Owner,
+        reply: ReplyEntry,
+    ) {
+        use std::os::unix::ffi::OsStrExt;
+        let result = (|| {
+            let name = name.to_str().ok_or(Error::Invalid)?;
+            let l = self.runtime.block_on(self.volume.symlink(
+                self.node(parent)?.id,
+                name,
+                target.as_os_str().as_bytes(),
+                self.creation_metadata(self.node(parent)?.id, owner, 0o777, 0, inode::SYMLINK)?,
+            ))?;
+            let number = self.register(
+                parent,
+                &Entry {
+                    name: name.into(),
+                    id: l.body.id,
+                    kind: inode::SYMLINK,
+                },
+            );
+            self.getattr_inner(number)
+        })();
+        match result {
+            Ok(a) => reply.entry(&TTL, &a, Generation(0)),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+    pub(super) fn handle_readlink(&self, ino: INodeNo, reply: ReplyData) {
+        let result = (|| {
+            self.runtime
+                .block_on(self.volume.readlink(self.node(ino)?.id))
+        })();
+        match result {
+            Ok(b) => reply.data(&b),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
     pub(super) fn handle_opendir(
         &self,
         _req: &Request,
@@ -101,15 +216,7 @@ impl S3Filesystem {
             ];
             for e in entries {
                 let number = self.register(ino, &e);
-                snapshot.push((
-                    number,
-                    if e.kind == inode::DIRECTORY {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    },
-                    e.name,
-                ));
+                snapshot.push((number, file_type(e.kind), e.name));
             }
             let mut s = self.state.lock().unwrap();
             let fh = s.next_handle;

@@ -155,7 +155,69 @@ try:
     (mounts[0]/'check').unlink();assert not (mounts[1]/'check').exists()
     stop(0);mounts[0]=start(0)
     assert (mounts[0]/'nested'/'small').read_bytes()==b'hello'
-    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','close-commit','disjoint-merge','append-first-CAS','snapshot-polling','numeric-metadata-permissions']})
+    # Namespace callbacks: replacement keeps old open snapshots alive.
+    (mounts[0]/'ns-left').mkdir();(mounts[0]/'ns-right').mkdir()
+    source=mounts[0]/'ns-left'/'source';source.write_bytes(b'new-content')
+    destination=mounts[1]/'ns-right'/'destination';destination.write_bytes(b'old-content')
+    old_fd=os.open(destination,os.O_RDONLY)
+    os.replace(source,mounts[0]/'ns-right'/'destination')
+    assert os.pread(old_fd,11,0)==b'old-content';os.close(old_fd)
+    assert (mounts[2]/'ns-right'/'destination').read_bytes()==b'new-content'
+    os.rename(mounts[0]/'ns-right'/'destination',mounts[0]/'ns-right'/'renamed')
+    os.link(mounts[1]/'ns-right'/'renamed',mounts[1]/'ns-left'/'alias')
+    assert (mounts[2]/'ns-left'/'alias').stat().st_nlink==2
+    survivor=os.open(mounts[2]/'ns-left'/'alias',os.O_RDWR)
+    (mounts[0]/'ns-right'/'renamed').unlink();(mounts[1]/'ns-left'/'alias').unlink()
+    assert os.fstat(survivor).st_nlink==0
+    os.pwrite(survivor,b'updated',0);os.fsync(survivor)
+    assert os.pread(survivor,7,0)==b'updated';os.close(survivor)
+    assert not (mounts[2]/'ns-left'/'alias').exists()
+    (mounts[0]/'ns-right'/'target').write_bytes(b'target')
+    os.symlink('../ns-right/target',mounts[0]/'ns-left'/'relative')
+    assert os.readlink(mounts[1]/'ns-left'/'relative')=='../ns-right/target'
+    assert (mounts[2]/'ns-left'/'relative').read_bytes()==b'target'
+    os.symlink(str(mounts[2]/'ns-right'/'target'),mounts[2]/'absolute')
+    assert (mounts[2]/'absolute').read_bytes()==b'target'
+    os.symlink('does-not-exist',mounts[0]/'dangling')
+    assert (mounts[1]/'dangling').is_symlink() and not (mounts[1]/'dangling').exists()
+    try:(mounts[0]/'ns-left').rmdir()
+    except OSError as e:assert e.errno==errno.ENOTEMPTY,e
+    else:raise AssertionError('rmdir accepted nonempty directory')
+    (mounts[1]/'ns-left'/'relative').unlink();(mounts[0]/'ns-left').rmdir()
+    (mounts[0]/'ns-right'/'child').mkdir();(mounts[0]/'empty-dir').mkdir()
+    os.rename(mounts[1]/'ns-right'/'child',mounts[1]/'empty-dir')
+    assert (mounts[2]/'empty-dir').is_dir() and not (mounts[2]/'ns-right'/'child').exists()
+    try:os.rename(mounts[0]/'ns-right',mounts[0]/'ns-right'/'cycle')
+    except OSError as e:assert e.errno==errno.EINVAL,e
+    else:raise AssertionError('directory cycle accepted')
+    (mounts[1]/'empty-dir').rmdir()
+    # Sparse 16 GiB logical file stores only the explicitly written bytes.
+    sparse=os.open(mounts[0]/'large-hole',os.O_CREAT|os.O_RDWR,0o600)
+    os.ftruncate(sparse,1<<34);os.fsync(sparse)
+    st=(mounts[1]/'large-hole').stat();assert st.st_size==1<<34 and st.st_blocks==0,st
+    os.pwrite(sparse,b'middle',1<<33);os.fsync(sparse);os.close(sparse)
+    with open(mounts[2]/'large-hole','rb') as f:f.seek((1<<33)-2);assert f.read(10)==bytes(2)+b'middle'+bytes(2)
+    assert (mounts[1]/'large-hole').stat().st_blocks<=8
+    # Repeat independent same-file writes from all three clients.
+    merge=mounts[0]/'merge-three';merge.write_bytes(bytes(4096))
+    for iteration in range(12):
+        fds=[os.open(m/'merge-three',os.O_RDWR) for m in mounts]
+        for i,fd in enumerate(fds):os.pwrite(fd,bytes([iteration+1+i])*16,i*64)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:list(pool.map(os.fsync,fds))
+        for fd in fds:os.close(fd)
+        data=merge.read_bytes()
+        for i in range(3):assert data[i*64:i*64+16]==bytes([iteration+1+i])*16
+    # Repeated directory create, cross-directory move, link and unlink contention.
+    (mounts[0]/'race-a').mkdir();(mounts[0]/'race-b').mkdir()
+    def namespace_worker(i):
+        for n in range(12):
+            name=f'entry-{i}-{n}';left=mounts[i]/'race-a'/name;right=mounts[i]/'race-b'/name
+            left.write_bytes(bytes([i])*32);os.rename(left,right)
+            os.link(right,left);right.unlink();left.unlink()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:list(pool.map(namespace_worker,range(3)))
+    assert list((mounts[2]/'race-a').iterdir())==[] and list((mounts[2]/'race-b').iterdir())==[]
+    (mounts[0]/'race-a').rmdir();(mounts[1]/'race-b').rmdir()
+    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','close-commit','disjoint-merge','append-first-CAS','snapshot-polling','numeric-metadata-permissions','rename-replace','hard-link','open-unlink-write','symlink','rmdir','directory-move-cycle','objectless-16GiB-hole','three-client-merge-12-rounds','namespace-contention-36-rounds']})
     if a.benchmark:
         # Same-directory metadata contention, with each writer on a different mount.
         def small_files(i):

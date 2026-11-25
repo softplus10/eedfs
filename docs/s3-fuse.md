@@ -60,7 +60,8 @@ shared byte buffers rather than cloning entire ciphertext payloads for retries.
 
 - Nested directories with encrypted inline directory entries.
 - Create/open, read/write, partial overwrite, truncate, sparse zero-filled gaps,
-  file unlink, directory listing, fsync/flush and remount persistence.
+  unlink (including open files), rename/replacement, rmdir, hard links, symlinks,
+  directory listing, fsync/flush and remount persistence.
 - Small files inline in inodes, larger files stored as independently encrypted
   immutable chunks. Separate derived keys for inode bodies and chunk data.
 - FUSE direct I/O prevents the kernel page cache from hiding remote consistency.
@@ -88,10 +89,10 @@ backpressure, error and close semantics. Chunk sizing is a writer policy, not fr
 small-write performance. Unreferenced uploads still require future GC.
 
 Stale same-file writers merge disjoint byte ranges, including within one chunk.
-Overlapping changed bytes and competing append size changes return `EAGAIN`. Its staged local changes remain until the handle is closed. The caller
+Overlapping writes (including equal-byte writes) and competing append size changes return `EAGAIN`. Its staged local changes remain until the handle is closed. The caller
 must close/reopen and reapply changes against a fresh version. Close-time flush
 errors must be checked, and applications should use explicit fsync to observe
-conflicts. No distributed lock or cross-client atomic append is provided.
+conflicts. No application file lock or cross-client atomic append is provided.
 
 Directory insert/remove operations reload the latest parent and retry ETag CAS
 up to 16 times, preserving independent entry edits. New inode objects are staged
@@ -115,12 +116,14 @@ Numeric uid/gid, mode, basic timestamps, chmod/chown and utimes are supported.
 See [concurrency and metadata](concurrency-and-metadata.md) for the exact merge,
 append, polling and DAC rules. `--inode-poll-seconds` defaults to five seconds;
 `--allow-other` explicitly enables other local users while retaining kernel checks.
-ACLs, xattrs, symlinks, hard links, mmap, locks, rename, rmdir and multi-object
-namespace transactions are not implemented. File unlink removes only its directory
-entry. No safe GC/reclamation exists: unlinked inodes, old chunks and failed staged
-writes remain in S3. Duplicate creates can leave unlinked inode objects.
-The flat inode index allows at most 4,096 chunks; writer policy bounds writable
-file size accordingly. No storage capacity report, rollback protection, encrypted
+Rename, rmdir, hard links and symlinks are supported as described in
+[directory leases](directory-leases.md). ACLs, xattrs, mmap, application locks and
+fallocate are unsupported. No cross-directory atomic transaction is promised.
+Unlinked inodes, old chunks and failed staged writes remain in S3; no safe GC
+exists. Link counts are not a reclamation authority after partial failures.
+Sparse holes create no data objects. At most 4096 actual chunks and 4096 hole
+descriptors fit the current flat index; logical size is bounded by i64::MAX.
+No storage capacity report, rollback protection, encrypted
 local cache, key rotation UI or sharing service is included.
 
 ## Validation and benchmark

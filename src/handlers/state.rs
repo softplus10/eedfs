@@ -110,6 +110,11 @@ impl S3Filesystem {
     pub(super) fn register(&self, parent: INodeNo, entry: &Entry) -> INodeNo {
         let mut s = self.state.lock().unwrap();
         if let Some(&ino) = s.ids.get(&entry.id) {
+            if entry.kind == inode::DIRECTORY
+                && let Some(n) = s.nodes.get_mut(&ino)
+            {
+                n.parent = parent.0;
+            }
             return INodeNo(ino);
         }
         let ino = s.next_inode;
@@ -165,22 +170,20 @@ impl S3Filesystem {
         kind: u8,
         size: u64,
         m: &Metadata,
+        nlink: u32,
+        allocated: u64,
     ) -> Result<FileAttr, Error> {
         Ok(FileAttr {
             ino,
             size,
-            blocks: size.div_ceil(512),
+            blocks: allocated.div_ceil(512),
             atime: m.atime.to_system_time()?,
             mtime: m.mtime.to_system_time()?,
             ctime: m.ctime.to_system_time()?,
             crtime: m.created.to_system_time()?,
-            kind: if kind == inode::DIRECTORY {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            },
+            kind: file_type(kind),
             perm: m.mode,
-            nlink: if kind == inode::DIRECTORY { 2 } else { 1 },
+            nlink,
             uid: m.uid,
             gid: m.gid,
             rdev: 0,
@@ -196,12 +199,31 @@ impl S3Filesystem {
         } else {
             loaded.body.size()?
         };
-        self.attr(ino, node.kind, size, &loaded.body.metadata)
+        self.attr(
+            ino,
+            node.kind,
+            size,
+            &loaded.body.metadata,
+            loaded.body.nlink,
+            allocation_size(&loaded.body),
+        )
     }
     pub(super) fn getattr_handle(&self, ino: INodeNo, fh: FileHandle) -> Result<FileAttr, Error> {
         let s = self.handle(fh)?;
         let s = s.lock().unwrap();
-        self.attr(ino, inode::FILE, s.size, &s.metadata)
+        let nlink = self
+            .runtime
+            .block_on(self.volume.load(s.base.body.id))?
+            .body
+            .nlink;
+        self.attr(
+            ino,
+            inode::FILE,
+            s.size,
+            &s.metadata,
+            nlink,
+            s.allocated_size(),
+        )
     }
     pub(super) fn commit(&self, fh: FileHandle) -> Result<(), Error> {
         let session = self.handle(fh)?;
@@ -214,6 +236,8 @@ impl S3Filesystem {
 pub(super) fn errno(error: Error) -> Errno {
     log::debug!("S3 filesystem operation failed: {error}");
     match error {
+        Error::Unsupported => Errno::EOPNOTSUPP,
+        Error::IsDirectory => Errno::EISDIR,
         Error::Permission => Errno::EPERM,
         Error::Conflict => Errno::EAGAIN,
         Error::Exists => Errno::EEXIST,
@@ -232,5 +256,25 @@ pub(super) fn errno(error: Error) -> Errno {
 impl Drop for S3Filesystem {
     fn drop(&mut self) {
         self.poller.abort();
+    }
+}
+
+pub(super) fn file_type(kind: u8) -> FileType {
+    match kind {
+        inode::DIRECTORY => FileType::Directory,
+        inode::SYMLINK => FileType::Symlink,
+        _ => FileType::RegularFile,
+    }
+}
+
+pub(super) fn allocation_size(body: &inode::InodeBody) -> u64 {
+    match &body.content {
+        inode::InodeContent::Inline(b) => b.len() as u64,
+        inode::InodeContent::Chunks(c) => c
+            .runs
+            .iter()
+            .flat_map(|r| &r.plaintext_lengths)
+            .map(|n| u64::from(*n))
+            .sum(),
     }
 }

@@ -77,8 +77,13 @@ fn main() {
         generation: 1,
         metadata: Default::default(),
         lease: None,
+        deleted: false,
+        nlink: 1,
+
+        mutations: vec![],
         content: InodeContent::Chunks(ChunkedContent {
             naming: naming.clone(),
+            holes: vec![],
             runs: vec![ChunkRun {
                 allocation_id: [4; 16],
                 first_chunk: 0,

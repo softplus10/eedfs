@@ -1,0 +1,166 @@
+{
+  "prefix": "fuse-bench-c49d63c775f349ab90e0951a6908da41/",
+  "chunk_size": 8388608,
+  "parallelism": 8,
+  "results": [
+    {
+      "case": "correctness",
+      "passed": true,
+      "checks": [
+        "cross-client",
+        "nested-directory",
+        "overwrite",
+        "truncate",
+        "sparse-gap",
+        "stale-writer-conflict",
+        "unlink",
+        "remount",
+        "partial-fsync-append",
+        "close-commit",
+        "disjoint-merge",
+        "append-first-CAS",
+        "snapshot-polling",
+        "numeric-metadata-permissions",
+        "rename-replace",
+        "hard-link",
+        "open-unlink-write",
+        "symlink",
+        "rmdir",
+        "directory-move-cycle",
+        "objectless-16GiB-hole",
+        "three-client-merge-12-rounds",
+        "namespace-contention-36-rounds"
+      ]
+    },
+    {
+      "case": "shared-directory-3-clients-4KiB-files",
+      "files": 60,
+      "seconds": 1.4230467489687726,
+      "files_s": 42.16305616346033,
+      "verified": true
+    },
+    {
+      "case": "64MiB-write-4KiB-syscalls-fsync",
+      "bytes": 67108864,
+      "seconds": 0.4518694669823162,
+      "mib_s": 141.6338227661322,
+      "write_seconds": 0.3767280720057897,
+      "fsync_seconds": 0.07508826797129586,
+      "sha256": "0690b57fc7770bca5f7bd2e1567e1fbc88f598c47dd53cc0bbe79730940f98a6"
+    },
+    {
+      "case": "4KiB-random-overwrite-fsync",
+      "operations": 32,
+      "bytes": 131072,
+      "seconds": 3.732190217007883,
+      "ops_s": 8.574053877043431,
+      "verified": true
+    },
+    {
+      "case": "sequential-write-fsync",
+      "bytes": 10737418240,
+      "seconds": 29.332902280963026,
+      "mib_s": 349.0960390457419,
+      "write_seconds": 29.236459708947223,
+      "fsync_seconds": 0.09639459801837802,
+      "sha256": "2518cd2dbe02871993e636ec735895ca7ddb343e753912f811cc90a0361d8e6b"
+    },
+    {
+      "case": "sequential-read-remounted-client",
+      "bytes": 10737418240,
+      "seconds": 54.88658652896993,
+      "mib_s": 186.56653014111527,
+      "sha256": "2518cd2dbe02871993e636ec735895ca7ddb343e753912f811cc90a0361d8e6b"
+    },
+    {
+      "case": "sequential-read-warm-open-handle",
+      "bytes": 10737418240,
+      "seconds": 16.867935248999856,
+      "mib_s": 607.0689653973599,
+      "sha256": "2518cd2dbe02871993e636ec735895ca7ddb343e753912f811cc90a0361d8e6b"
+    },
+    {
+      "case": "parallel-write-fsync-3-clients",
+      "bytes": 1610612736,
+      "seconds": 3.795589937013574,
+      "mib_s": 404.6801750160997,
+      "clients": [
+        {
+          "bytes": 536870912,
+          "seconds": 3.7370714700082317,
+          "mib_s": 137.00567519487987,
+          "write_seconds": 3.4678590549738146,
+          "fsync_seconds": 0.2691667629987933,
+          "sha256": "6caa096d5090ed6cee532fb7aac2e01bca15cc7daca7b8b6a80b44da441f8cfc"
+        },
+        {
+          "bytes": 536870912,
+          "seconds": 3.7494456080021337,
+          "mib_s": 136.553521114503,
+          "write_seconds": 3.5224555250024423,
+          "fsync_seconds": 0.22691965900594369,
+          "sha256": "21f9455ba0a07c8f444bedcf7153e75b0b08a7634cb1e30014c8f85c3a2245c1"
+        },
+        {
+          "bytes": 536870912,
+          "seconds": 3.7905961620272137,
+          "mib_s": 135.07110177787496,
+          "write_seconds": 3.7058990450459532,
+          "fsync_seconds": 0.08462148596299812,
+          "sha256": "2f79323a52832fc161adff4df8e3f30d403f6f337d9e4f97173930f1a14170f9"
+        }
+      ],
+      "verified": true
+    }
+  ],
+  "environment": {
+    "date": "2026-11-26",
+    "location": "local workstation; not Proxmox",
+    "cpu": "Intel Core Ultra 7 155H",
+    "kernel": "6.12.0-211.67.1.el10_2.x86_64",
+    "filesystem": "XFS on LUKS",
+    "transport": "HTTP loopback; same machine and storage",
+    "rust": "1.100.0",
+    "minio": "pinned source RELEASE.2025-04-22T22-12-26Z, DEVELOPMENT.GOGET, Go 1.27.3",
+    "samples": 1,
+    "caches": "uncontrolled; remount clears client caches only"
+  },
+  "source": {
+    "parent_commit": "618fb02",
+    "note": "Data-path code matches the final change; subsequent namespace-only edge fixes were validated by a separate mounted correctness run.",
+    "data_path_sha256": {
+      "src/volume/session.rs": "331a76a1894884ebd65d918ec1cb0e76affdc8299dc5a7c85e0133a176155f48",
+      "src/format/inode.rs": "bb3e5391c6422ab898d33621f29553b0f60f67e36051e4ae5db4770c4cbfd592",
+      "src/storage/s3.rs": "a8102995a44fd31f9c46beb739384ffb2ad76c172b93b4d8221a04fe000436e6"
+    }
+  },
+  "final_namespace_regression": {
+    "case": "correctness",
+    "passed": true,
+    "checks": [
+      "cross-client",
+      "nested-directory",
+      "overwrite",
+      "truncate",
+      "sparse-gap",
+      "stale-writer-conflict",
+      "unlink",
+      "remount",
+      "partial-fsync-append",
+      "close-commit",
+      "disjoint-merge",
+      "append-first-CAS",
+      "snapshot-polling",
+      "numeric-metadata-permissions",
+      "rename-replace",
+      "hard-link",
+      "open-unlink-write",
+      "symlink",
+      "rmdir",
+      "directory-move-cycle",
+      "objectless-16GiB-hole",
+      "three-client-merge-12-rounds",
+      "namespace-contention-36-rounds"
+    ]
+  }
+}

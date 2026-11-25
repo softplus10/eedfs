@@ -5,23 +5,36 @@ large indexes and GC remain separate work.
 
 ## Disjoint writes
 
-A stale inode CAS does not automatically fail an ordinary data write. The client
-loads the latest inode and performs a content-based three-way merge using its
-baseline snapshot, the latest snapshot and the exact locally written byte ranges.
+A stale inode CAS loads the latest inode and checks committed byte-range history.
+Disjoint writes merge, including within one chunk and inline data. Overlapping
+writes return EAGAIN even when the new bytes equal the old bytes, or another
+writer restored the old bytes (ABA). No last-writer overwrite is performed.
 
-- Local ranges whose baseline bytes still match the latest bytes can be reapplied.
-- This works for different ranges inside the same encrypted chunk, and for inline files.
-- Latest bytes outside those local ranges and unrelated latest metadata are preserved.
-- Conflicting ranges return EAGAIN. No arbitrary last-writer overwrite is performed.
-- CAS/merge retry is bounded to 16 attempts. The local spool survives a failed sync.
-- The implementation compares content, not a persisted per-operation history. A
-  remote write that leaves/restores the baseline bytes is indistinguishable from
-  no content change. This is not a serializable transaction/history guarantee.
+The inode stores a compact last-writer interval map, including the last EOF
+change and explicit attribute-field changes. New commits replace covered ranges
+and field versions, retaining older untouched intervals. Old handles therefore
+remain mergeable after arbitrarily many unrelated commits; there is no age cutoff
+or retained-history floor. Equal-byte and ABA changes remain detectable. This is
+conflict metadata, not an operation journal. The flat map is bounded to 4096
+version groups and 65,536 intervals, subject to the inode's 1 MiB size limit.
+CAS/merge retry is bounded to 16 attempts. Local data survives a failed fsync until
+close. Metadata uses field-based merge: independent fields are preserved; equal
+requested values are successful. Automatic mtime/ctime changes do not introduce
+conflicts between otherwise disjoint writes.
 
-Actual written ranges are coalesced per generation and bounded to 65,536 intervals.
-The existing flat chunk-reference limit also remains. Local truncate/resize
-conflicts and observed remote shrink conflicts remain conservatively rejected;
-this does not introduce a new truncate concurrency policy.
+## Truncate and sparse ranges
+
+Shrink conflicts with writes in the removed range but merges with untouched
+prefix writes. Competing EOF-changing operations, including truncate versus
+append, allow only the first successful CAS. A prefix writer can preserve a
+remote shrink if its own range remains valid. Shrink then extension reads as zero
+and never revives the discarded bytes.
+
+Sparse ranges use inode-local `Hole { offset:u64, len:u64 }` records with no S3
+data objects. All-hole files have an empty chunk-run list. Holes interleave with
+actual chunk boundaries; writes split holes and upload only actual data ranges.
+`st_blocks` reports committed data bytes rather than logical hole size. Logical
+length is bounded by i64::MAX; actual chunks/holes retain flat-index limits.
 
 ## Append: first successful CAS wins
 
@@ -63,7 +76,7 @@ already opened file.
 
 ## Persisted metadata and permissions
 
-Inode format **v5** retains encrypted `Metadata` in the inode body:
+Inode format **v6** retains encrypted `Metadata` in the inode body:
 
 ```
 Metadata {
@@ -105,13 +118,14 @@ trusted-client model, not remote per-user authentication: a holder of the volume
 keys and S3 write credentials can construct its own metadata. There is no account
 mapping, identity service, per-user key isolation or server-side numeric DAC.
 
-ACLs, xattrs, hard links, directory link-count maintenance, rename/rmdir, mmap,
-storage-capacity reporting, rollback protection and reclamation are not added.
+ACLs, xattrs, application file locks, mmap, fallocate, storage-capacity reporting,
+rollback protection and reclamation are unsupported. Namespace operations are
+specified in [directory leases](directory-leases.md).
 
 ## Compatibility and validation
 
 Header v4, directory payload v1 and data chunks v2 are unchanged. Inode envelopes
-and bodies are v5 so older clients cannot silently ignore directory lease state.
+and bodies are v6 so older clients cannot silently ignore directory lease state.
 The prototype rejects earlier inode versions; no automatic migration is provided.
 Recreate disposable older test volumes. Opening validates the root inode before
 mounting so unsupported versions fail early.
@@ -125,7 +139,6 @@ reporting and supplementary-group chgrp without a cross-client identity lookup.
 
 ## Namespace policy update
 
-The selected rename, unlink, link and sparse policies and the implemented
-inode-local lease API are recorded in [directory leases](directory-leases.md).
-No operation ID or interrupted-operation recovery is used. The lease primitive
-does not yet expose rename/rmdir/hard-link/symlink callbacks or sparse extents.
+Rename, rmdir, hard links and symlinks are connected to FUSE, using the rules in
+[directory leases](directory-leases.md). No operation ID or interrupted-operation
+recovery is used. Physical GC and distributed open-snapshot protection remain deferred.

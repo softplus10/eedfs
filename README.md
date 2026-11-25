@@ -9,6 +9,8 @@ file and directory operations, fsync commits and remount persistence. The older
 [S3/FUSE guide](docs/s3-fuse.md) for setup, supported behavior and limitations,
 and the [MinIO/filesystem benchmark](docs/benchmarks/s3-fuse-2026-11-24.md) for
 10 GiB and three-client results.
+The [namespace/sparse validation](docs/benchmarks/namespace-2026-11-26.md) records
+the current policies, three-client checks and a new 10 GiB run.
 Disjoint file writes merge, append uses first-CAS-wins, and open readers keep
 snapshots. Numeric uid/gid/mode/timestamps are persisted. Full POSIX semantics
 and safe GC remain future work. See the [policy contract](docs/concurrency-and-metadata.md).
@@ -122,7 +124,7 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 
 - [Header v4](docs/header-format.md): password keyslots, protected root inode ID
   and filesystem-wide inode naming configuration.
-- [Inode v5/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
+- [Inode v6/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
   encryption profile, inline data or variable-size chunk runs. Chunk bytes contain
   only nonce and ciphertext/tag; names derive from allocation ID and chunk index.
 - [Crypto profiles and key hierarchy](docs/crypto.md): XChaCha20-Poly1305,
@@ -169,9 +171,10 @@ disk I/O. Results measure CPU/allocation costs, not NAS throughput.
 - Metadata conflict detection, merge, and retry.
 - Client-side encryption of object names and contents.
 
-Cross-directory atomic changes, key lifecycle workflows, crash recovery, and safe
-reclamation still need to be designed. The scaffold does not implement or
-guarantee these features.
+Rename, rmdir, hard links, symlinks and object-free sparse ranges are implemented.
+Cross-directory rename is destination-first rather than atomic across directories.
+Key lifecycle workflows and safe reclamation remain separate work. Interrupted
+namespace operations are intentionally not recovered.
 
 ## License
 
@@ -179,4 +182,5 @@ guarantee these features.
 
 [Directory leases](docs/directory-leases.md) store an expiring holder in the encrypted
 inode and fence updates with its ETag. There is no operation ID or interrupted-operation
-recovery. The lease API is a foundation; rename/rmdir callbacks are not yet implemented.
+recovery. FUSE namespace callbacks use these leases; directory topology changes
+also take the root inode lease to serialize ancestry checks.

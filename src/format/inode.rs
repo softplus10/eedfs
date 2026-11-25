@@ -12,9 +12,11 @@ use super::data_chunk::MAX_CHUNK_PLAINTEXT;
 use codec::{bounded_bytes, serialize_bytes};
 use std::fmt;
 
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 pub const FILE: u8 = 1;
 pub const DIRECTORY: u8 = 2;
+pub const SYMLINK: u8 = 3;
+pub const MAX_MUTATIONS: usize = 4096;
 pub const MAX_INLINE_SIZE: usize = 64 * 1024;
 pub const MAX_CHUNK_REFERENCES: usize = 4096;
 pub const MAX_INODE_SIZE: usize = MAX_METADATA_SIZE;
@@ -40,6 +42,11 @@ pub struct InodeBody {
     pub content: InodeContent,
     pub metadata: super::metadata::Metadata,
     pub lease: Option<DirectoryLease>,
+    pub deleted: bool,
+    pub nlink: u32,
+
+    #[serde(deserialize_with = "bounded::<_, _, MAX_MUTATIONS>")]
+    pub mutations: Vec<Mutation>,
     #[serde(deserialize_with = "bounded::<_, _, MAX_EXTENSIONS>")]
     pub extensions: Vec<Extension>,
 }
@@ -65,7 +72,22 @@ pub struct DirectoryLease {
     pub expires_at: super::metadata::Timestamp,
 }
 
-/// Persisted enum tags are fixed by schema v5: Inline=0, Chunks=1.
+/// Recent committed byte mutations detect overlap even for equal-byte/ABA writes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mutation {
+    pub generation: u64,
+    pub size_changed: bool,
+    pub attribute_fields: u8,
+    #[serde(deserialize_with = "bounded::<_, _, 65536>")]
+    pub ranges: Vec<(u64, u64)>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hole {
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Persisted enum tags are fixed by schema v6: Inline=0, Chunks=1.
 /// Reordering/inserting variants is a format change, not an implementation detail.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InodeContent {
@@ -97,6 +119,8 @@ pub struct ChunkedContent {
     pub naming: NamingConfig,
     #[serde(deserialize_with = "bounded::<_, _, MAX_CHUNK_REFERENCES>")]
     pub runs: Vec<ChunkRun>,
+    #[serde(deserialize_with = "bounded::<_, _, MAX_CHUNK_REFERENCES>")]
+    pub holes: Vec<Hole>,
 }
 
 /// Fresh allocation ID per newly written run. COW edits split/reuse old runs.
@@ -110,7 +134,10 @@ pub struct ChunkRun {
 impl ChunkedContent {
     pub fn size(&self) -> Result<u64> {
         self.naming.algorithm.validate()?;
-        if self.runs.is_empty() || self.runs.len() > MAX_CHUNK_REFERENCES {
+        if (self.runs.is_empty() && self.holes.is_empty())
+            || self.holes.len() > MAX_CHUNK_REFERENCES
+            || self.runs.len() > MAX_CHUNK_REFERENCES
+        {
             return Err(FormatError::Invalid("chunk configuration"));
         }
         let mut count = 0usize;
@@ -137,7 +164,34 @@ impl ChunkedContent {
                     .ok_or(FormatError::TooLarge)?;
             }
         }
-        Ok(size)
+        let mut cursor = 0u64;
+        let mut hole_index = 0;
+        for len in self.runs.iter().flat_map(|r| &r.plaintext_lengths) {
+            while let Some(h) = self.holes.get(hole_index) {
+                if h.len == 0 || h.offset < cursor {
+                    return Err(FormatError::Invalid("hole layout"));
+                }
+                if h.offset != cursor {
+                    break;
+                }
+                cursor = cursor.checked_add(h.len).ok_or(FormatError::TooLarge)?;
+                hole_index += 1;
+            }
+            cursor = cursor
+                .checked_add(u64::from(*len))
+                .ok_or(FormatError::TooLarge)?;
+        }
+        while let Some(h) = self.holes.get(hole_index) {
+            if h.len == 0 || h.offset != cursor {
+                return Err(FormatError::Invalid("hole layout"));
+            }
+            cursor = cursor.checked_add(h.len).ok_or(FormatError::TooLarge)?;
+            hole_index += 1;
+        }
+        if cursor > i64::MAX as u64 {
+            return Err(FormatError::TooLarge);
+        }
+        Ok(cursor)
     }
 }
 impl InodeContent {
@@ -206,7 +260,7 @@ impl InodeObject {
 }
 impl InodeBody {
     fn validate(&self) -> Result<()> {
-        if self.kind != FILE && self.kind != DIRECTORY {
+        if !matches!(self.kind, FILE | DIRECTORY | SYMLINK) {
             return Err(FormatError::Invalid("inode kind"));
         }
         if let Some(lease) = &self.lease {
@@ -214,6 +268,47 @@ impl InodeBody {
                 return Err(FormatError::Invalid("directory lease"));
             }
             lease.expires_at.to_system_time()?;
+        }
+        if self.deleted && self.kind != DIRECTORY {
+            return Err(FormatError::Invalid("deleted directory"));
+        }
+        if self.kind == SYMLINK
+            && !matches!(&self.content, InodeContent::Inline(b) if !b.is_empty() && !b.contains(&0) && b.len() <= 4096)
+        {
+            return Err(FormatError::Invalid("symlink target"));
+        }
+        if self.mutations.len() > MAX_MUTATIONS {
+            return Err(FormatError::TooLarge);
+        }
+        let mut previous = 0;
+        for m in &self.mutations {
+            if m.generation <= previous
+                || m.generation > self.generation
+                || m.attribute_fields & !31 != 0
+                || m.ranges.len() > 65536
+                || m.ranges.iter().any(|(a, b)| a >= b || *b > i64::MAX as u64)
+            {
+                return Err(FormatError::Invalid("mutation history"));
+            }
+            previous = m.generation;
+        }
+        let mut ranges = Vec::new();
+        let mut fields = 0u8;
+        let mut size_record = false;
+        for m in &self.mutations {
+            if fields & m.attribute_fields != 0 || (size_record && m.size_changed) {
+                return Err(FormatError::Invalid("duplicate mutation fields"));
+            }
+            fields |= m.attribute_fields;
+            size_record |= m.size_changed;
+            ranges.extend(m.ranges.iter().copied());
+            if ranges.len() > 65536 {
+                return Err(FormatError::TooLarge);
+            }
+        }
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|p| p[0].1 > p[1].0) {
+            return Err(FormatError::Invalid("overlapping mutation ranges"));
         }
         self.content.size()?;
         self.metadata.validate()?;

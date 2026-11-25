@@ -2,7 +2,7 @@
 use super::{
     codec,
     header::FormatError,
-    inode::{DIRECTORY, FILE, MAX_INLINE_SIZE},
+    inode::{DIRECTORY, FILE, MAX_INLINE_SIZE, SYMLINK},
 };
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +28,7 @@ impl Directory {
                 || e.name.contains(['/', '\0'])
                 || matches!(e.name.as_str(), "." | "..")
                 || e.name.as_str() <= previous
-                || !matches!(e.kind, FILE | DIRECTORY)
+                || !matches!(e.kind, FILE | DIRECTORY | SYMLINK)
             {
                 return Err(FormatError::Invalid("directory entry"));
             }

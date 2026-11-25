@@ -217,14 +217,25 @@ impl S3Filesystem {
                 mtime: time(mtime)?,
             };
             let node = self.node(ino)?;
-            if node.kind == inode::DIRECTORY {
+            if node.kind != inode::FILE {
                 if size.is_some() {
                     return Err(Error::Invalid);
                 }
                 let loaded = self
                     .runtime
                     .block_on(self.volume.update_metadata(node.id, &update, actor))?;
-                return self.attr(ino, node.kind, 0, &loaded.body.metadata);
+                return self.attr(
+                    ino,
+                    node.kind,
+                    if node.kind == inode::DIRECTORY {
+                        0
+                    } else {
+                        loaded.body.size()?
+                    },
+                    &loaded.body.metadata,
+                    loaded.body.nlink,
+                    allocation_size(&loaded.body),
+                );
             }
             let s = if let Some(fh) = fh {
                 self.handle(fh)?
@@ -243,7 +254,14 @@ impl S3Filesystem {
                 self.runtime.block_on(session.commit())?;
                 self.snapshots.published(&session.base);
             }
-            self.attr(ino, inode::FILE, session.size, &session.metadata)
+            self.attr(
+                ino,
+                inode::FILE,
+                session.size,
+                &session.metadata,
+                session.base.body.nlink,
+                session.allocated_size(),
+            )
         })();
         match result {
             Ok(a) => reply.attr(&TTL, &a),
