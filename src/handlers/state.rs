@@ -1,14 +1,14 @@
 //! Writable prototype adapter. S3 persistence is acknowledged on fsync/flush.
 use eedfs::{
-    format::{directory::Entry, inode},
-    volume::{Error, FileSession, Loaded, Volume},
+    format::{directory::Entry, inode, metadata::Metadata},
+    volume::{Error, FileSession, Loaded, Volume, snapshots::Snapshots},
 };
 use fuser::*;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, Weak},
-    time::{Duration, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 pub(super) const TTL: Duration = Duration::ZERO;
 #[derive(Clone)]
@@ -24,7 +24,6 @@ pub(super) struct State {
     pub(super) ids: HashMap<[u8; 16], u64>,
     pub(super) next_inode: u64,
     pub(super) next_handle: u64,
-    pub(super) active: HashMap<u64, Weak<Mutex<FileSession>>>,
     pub(super) handles: HashMap<u64, Session>,
     pub(super) directories: HashMap<u64, DirEntries>,
 }
@@ -33,22 +32,32 @@ pub struct S3Filesystem {
     pub(super) runtime: tokio::runtime::Runtime,
     pub(super) state: Mutex<State>,
     pub(super) cache: PathBuf,
-    pub(super) uid: u32,
-    pub(super) gid: u32,
+    pub(super) snapshots: Arc<Snapshots>,
+    poller: tokio::task::JoinHandle<()>,
 }
 impl S3Filesystem {
     pub fn new(
         volume: Arc<Volume>,
         runtime: tokio::runtime::Runtime,
         cache: PathBuf,
-        uid: u32,
-        gid: u32,
+        poll_interval: Duration,
     ) -> Self {
         let root = Node {
             id: volume.root,
             kind: inode::DIRECTORY,
             parent: 1,
         };
+        let snapshots = Arc::new(Snapshots::new(volume.clone()));
+        let polling = snapshots.clone();
+        let poller = runtime.spawn(async move {
+            let mut interval = tokio::time::interval(poll_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                polling.poll_once().await;
+            }
+        });
         Self {
             volume,
             runtime,
@@ -57,14 +66,37 @@ impl S3Filesystem {
                 ids: HashMap::from([(root.id, 1)]),
                 next_inode: 2,
                 next_handle: 1,
-                active: HashMap::new(),
                 handles: HashMap::new(),
                 directories: HashMap::new(),
             }),
             cache,
-            uid,
-            gid,
+            snapshots,
+            poller,
         }
+    }
+    pub(super) fn creation_metadata(
+        &self,
+        parent: [u8; 16],
+        owner: Owner,
+        mode: u32,
+        umask: u32,
+        kind: u8,
+    ) -> Result<Metadata, Error> {
+        let parent = self.runtime.block_on(self.volume.load(parent))?;
+        let inherit = parent.body.metadata.mode & 0o2000 != 0;
+        let mut mode = (mode & !umask & 0o7777) as u16;
+        if inherit && kind == inode::DIRECTORY {
+            mode |= 0o2000;
+        }
+        Ok(Metadata::new(
+            owner.uid,
+            if inherit {
+                parent.body.metadata.gid
+            } else {
+                owner.gid
+            },
+            mode,
+        ))
     }
     pub(super) fn node(&self, ino: INodeNo) -> Result<Node, Error> {
         self.state
@@ -94,25 +126,9 @@ impl S3Filesystem {
         INodeNo(ino)
     }
     pub(super) fn session(&self, ino: INodeNo) -> Result<Session, Error> {
-        if let Some(s) = self
-            .state
-            .lock()
-            .unwrap()
-            .active
-            .get(&ino.0)
-            .and_then(Weak::upgrade)
-        {
-            return Ok(s);
-        }
         let node = self.node(ino)?;
         let loaded = self.runtime.block_on(self.volume.load(node.id))?;
-        let candidate = Arc::new(Mutex::new(self.volume.file(loaded, &self.cache)?));
-        let mut state = self.state.lock().unwrap();
-        if let Some(s) = state.active.get(&ino.0).and_then(Weak::upgrade) {
-            return Ok(s);
-        }
-        state.active.insert(ino.0, Arc::downgrade(&candidate));
-        Ok(candidate)
+        Ok(Arc::new(Mutex::new(self.volume.file(loaded, &self.cache)?)))
     }
     pub(super) fn handle(&self, fh: FileHandle) -> Result<Session, Error> {
         self.state
@@ -127,76 +143,78 @@ impl S3Filesystem {
         &self,
         ino: INodeNo,
         loaded: Option<Loaded>,
+        _flags: OpenFlags,
     ) -> Result<FileHandle, Error> {
-        let session = if let Some(loaded) = loaded {
-            Arc::new(Mutex::new(self.volume.file(loaded, &self.cache)?))
-        } else {
-            self.session(ino)?
+        let loaded = match loaded {
+            Some(l) => l,
+            None => self
+                .runtime
+                .block_on(self.snapshots.open(self.node(ino)?.id))?,
         };
+        let session = Arc::new(Mutex::new(self.volume.file(loaded.clone(), &self.cache)?));
+        self.snapshots.pin(&loaded);
         let mut s = self.state.lock().unwrap();
         let fh = s.next_handle;
         s.next_handle += 1;
-        s.active.insert(ino.0, Arc::downgrade(&session));
         s.handles.insert(fh, session);
         Ok(FileHandle(fh))
     }
-    pub(super) fn attr(&self, ino: INodeNo, kind: u8, size: u64) -> FileAttr {
-        FileAttr {
+    pub(super) fn attr(
+        &self,
+        ino: INodeNo,
+        kind: u8,
+        size: u64,
+        m: &Metadata,
+    ) -> Result<FileAttr, Error> {
+        Ok(FileAttr {
             ino,
             size,
             blocks: size.div_ceil(512),
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: m.atime.to_system_time()?,
+            mtime: m.mtime.to_system_time()?,
+            ctime: m.ctime.to_system_time()?,
+            crtime: m.created.to_system_time()?,
             kind: if kind == inode::DIRECTORY {
                 FileType::Directory
             } else {
                 FileType::RegularFile
             },
-            perm: if kind == inode::DIRECTORY {
-                0o755
-            } else {
-                0o644
-            },
+            perm: m.mode,
             nlink: if kind == inode::DIRECTORY { 2 } else { 1 },
-            uid: self.uid,
-            gid: self.gid,
+            uid: m.uid,
+            gid: m.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
-        }
+        })
     }
     pub(super) fn getattr_inner(&self, ino: INodeNo) -> Result<FileAttr, Error> {
         let node = self.node(ino)?;
-        if node.kind == inode::DIRECTORY {
-            return Ok(self.attr(ino, node.kind, 0));
-        }
-        let active = self
-            .state
-            .lock()
-            .unwrap()
-            .active
-            .get(&ino.0)
-            .and_then(Weak::upgrade);
-        let size = if let Some(s) = active {
-            s.lock().unwrap().size
+        let loaded = self.runtime.block_on(self.volume.load(node.id))?;
+        let size = if node.kind == inode::DIRECTORY {
+            0
         } else {
-            self.runtime
-                .block_on(self.volume.load(node.id))?
-                .body
-                .size()?
+            loaded.body.size()?
         };
-        Ok(self.attr(ino, node.kind, size))
+        self.attr(ino, node.kind, size, &loaded.body.metadata)
+    }
+    pub(super) fn getattr_handle(&self, ino: INodeNo, fh: FileHandle) -> Result<FileAttr, Error> {
+        let s = self.handle(fh)?;
+        let s = s.lock().unwrap();
+        self.attr(ino, inode::FILE, s.size, &s.metadata)
     }
     pub(super) fn commit(&self, fh: FileHandle) -> Result<(), Error> {
         let session = self.handle(fh)?;
-        self.runtime.block_on(session.lock().unwrap().commit())
+        let mut session = session.lock().unwrap();
+        self.runtime.block_on(session.commit())?;
+        self.snapshots.published(&session.base);
+        Ok(())
     }
 }
 pub(super) fn errno(error: Error) -> Errno {
     log::debug!("S3 filesystem operation failed: {error}");
     match error {
+        Error::Permission => Errno::EPERM,
         Error::Conflict => Errno::EAGAIN,
         Error::Exists => Errno::EEXIST,
         Error::Missing => Errno::ENOENT,
@@ -208,5 +226,11 @@ pub(super) fn errno(error: Error) -> Errno {
             log::error!("S3 filesystem I/O failed: {e}");
             Errno::EIO
         }
+    }
+}
+
+impl Drop for S3Filesystem {
+    fn drop(&mut self) {
+        self.poller.abort();
     }
 }

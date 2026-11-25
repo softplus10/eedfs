@@ -32,6 +32,12 @@ enum Command {
         cache_dir: PathBuf,
         #[arg(long, default_value_t = 8)]
         threads: usize,
+        /// Poll metadata for open snapshots without changing their content.
+        #[arg(long,default_value_t=5,value_parser=clap::value_parser!(u64).range(1..))]
+        inode_poll_seconds: u64,
+        /// Permit other local users; kernel uid/gid/mode checks remain enabled.
+        #[arg(long)]
+        allow_other: bool,
     },
     /// Inspect S3 connectivity without modifying the bucket.
     S3 {
@@ -116,12 +122,18 @@ fn main() -> Result<(), ConnectionError> {
                 if args.create_bucket {
                     c.create_bucket().await?;
                 }
-                eedfs::volume::Volume::format(
+                eedfs::volume::Volume::format_with_metadata(
                     c,
                     args.prefix,
                     &password,
                     args.chunk_size,
                     args.parallelism,
+                    // POSIX effective IDs; no remote identity mapping.
+                    eedfs::format::metadata::Metadata::new(
+                        unsafe { libc::geteuid() },
+                        unsafe { libc::getegid() },
+                        0o755,
+                    ),
                 )
                 .await?;
                 Ok::<_, ConnectionError>(())
@@ -134,6 +146,8 @@ fn main() -> Result<(), ConnectionError> {
             volume: args,
             cache_dir,
             threads,
+            inode_poll_seconds,
+            allow_other,
         } => {
             if threads == 0 || threads > 64 {
                 return Err("threads must be 1..64".into());
@@ -150,7 +164,6 @@ fn main() -> Result<(), ConnectionError> {
             if cache.starts_with(&mountpoint) {
                 return Err("cache directory must be outside mountpoint".into());
             }
-            let metadata = mountpoint.metadata()?;
             let runtime = tokio::runtime::Runtime::new()?;
             let volume = runtime.block_on(eedfs::volume::Volume::open(
                 connection(args.s3)?,
@@ -161,16 +174,25 @@ fn main() -> Result<(), ConnectionError> {
             ))?;
             let mut config = Config::default();
             config.n_threads = Some(threads);
+            if allow_other {
+                config.acl = fuser::SessionACL::All;
+            }
             config.mount_options = vec![
                 MountOption::FSName("eedfs-s3".into()),
                 MountOption::Subtype("eedfs".into()),
                 MountOption::RW,
+                MountOption::NoAtime,
                 MountOption::DefaultPermissions,
                 MountOption::NoDev,
                 MountOption::NoSuid,
             ];
             fuser::mount(
-                handlers::S3Filesystem::new(volume, runtime, cache, metadata.uid(), metadata.gid()),
+                handlers::S3Filesystem::new(
+                    volume,
+                    runtime,
+                    cache,
+                    Duration::from_secs(inode_poll_seconds),
+                ),
                 mountpoint,
                 &config,
             )?;

@@ -2,6 +2,7 @@
 pub mod development;
 mod directory;
 mod file;
+mod permissions;
 mod state;
 use fuser::*;
 pub use state::S3Filesystem;

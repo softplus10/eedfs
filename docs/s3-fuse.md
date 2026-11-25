@@ -64,8 +64,8 @@ shared byte buffers rather than cloning entire ciphertext payloads for retries.
 - Small files inline in inodes, larger files stored as independently encrypted
   immutable chunks. Separate derived keys for inode bodies and chunk data.
 - FUSE direct I/O prevents the kernel page cache from hiding remote consistency.
-  Open handles share a per-client session. Reads of an open handle see its snapshot;
-  a new open after the last close reloads the inode. Attribute/entry TTL is zero.
+  Each open handle has an independent snapshot/session. Reads of an open handle see its snapshot;
+  each new open validates the latest inode, even while old snapshots remain open. Attribute/entry TTL is zero.
 - Local staging uses anonymous mode-0600 files outside the mount; plaintext spool
   contents consume local disk while handles are open. File names are immediately
   unlinked, so closing the last handle or process exit releases the spool. Local
@@ -87,8 +87,8 @@ See the [writeback contract](writeback.md) for precise acceptance, publication,
 backpressure, error and close semantics. Chunk sizing is a writer policy, not free
 small-write performance. Unreferenced uploads still require future GC.
 
-A stale same-file writer gets `EAGAIN`; no automatic merge of same-file data is
-claimed. Its staged local changes remain until the handle is closed. The caller
+Stale same-file writers merge disjoint byte ranges, including within one chunk.
+Overlapping changed bytes and competing append size changes return `EAGAIN`. Its staged local changes remain until the handle is closed. The caller
 must close/reopen and reapply changes against a fresh version. Close-time flush
 errors must be checked, and applications should use explicit fsync to observe
 conflicts. No distributed lock or cross-client atomic append is provided.
@@ -111,12 +111,14 @@ inside the directory inode. There are no unencrypted S3 filename manifests.
 
 ## Deliberate limits
 
-Fixed mount-owner identity, file mode 0644 and directory mode 0755; requested
-creation modes are not persisted. chmod/chown/utimes, timestamps, xattrs,
-symlinks, hard links, mmap/writeback cache, locks, rename, rmdir and POSIX atomic
+Numeric uid/gid, mode, basic timestamps, chmod/chown and utimes are supported.
+See [concurrency and metadata](concurrency-and-metadata.md) for the exact merge,
+append, polling and DAC rules. `--inode-poll-seconds` defaults to five seconds;
+`--allow-other` explicitly enables other local users while retaining kernel checks.
+ACLs, xattrs, symlinks, hard links, mmap, locks, rename, rmdir and multi-object
 namespace transactions are not implemented. File unlink removes only its directory
 entry. No safe GC/reclamation exists: unlinked inodes, old chunks and failed staged
-writes remain in S3. Duplicate create attempts may leave unlinked inode objects.
+writes remain in S3. Duplicate creates can leave unlinked inode objects.
 The flat inode index allows at most 4,096 chunks; writer policy bounds writable
 file size accordingly. No storage capacity report, rollback protection, encrypted
 local cache, key rotation UI or sharing service is included.

@@ -3,7 +3,7 @@
 Requires a disposable S3 bucket, Linux FUSE, provider S3_* env and a password file.
 Creates a unique prefix; never deletes remote objects (there is no GC yet).
 """
-import argparse, concurrent.futures, errno, hashlib, json, os, pathlib, random, subprocess, time, uuid
+import argparse, concurrent.futures, errno, hashlib, json, os, pathlib, random, stat, subprocess, sys, time, uuid
 
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--binary',default='target/release/eedfs')
@@ -18,6 +18,7 @@ p.add_argument('--output',required=True)
 a=p.parse_args()
 if min(a.large_mib,a.parallel_mib,a.chunk_size,a.parallelism)<=0:p.error('sizes and parallelism must be positive')
 root=pathlib.Path(a.work_dir).resolve();root.mkdir(parents=True,exist_ok=True)
+if os.geteuid()==0:root.chmod(0o755)  # permit numeric-UID test traversal
 binary=str(pathlib.Path(a.binary).resolve());password=str(pathlib.Path(a.password_file).resolve())
 prefix='fuse-bench-'+uuid.uuid4().hex+'/'
 common=['--password-file',password,'--prefix',prefix,'--chunk-size',str(a.chunk_size),'--parallelism',str(a.parallelism)]
@@ -26,7 +27,8 @@ processes={};logs=[];results=[]
 def start(i):
     mount=root/f'mount-{i}';cache=root/f'cache-{i}';mount.mkdir(exist_ok=True);cache.mkdir(exist_ok=True)
     log=open(root/f'client-{i}.log','ab');logs.append(log)
-    proc=subprocess.Popen([binary,'mount-s3',str(mount),*common,'--cache-dir',str(cache)],stdout=log,stderr=log)
+    options=['--inode-poll-seconds','1']+(['--allow-other'] if os.geteuid()==0 else [])
+    proc=subprocess.Popen([binary,'mount-s3',str(mount),*common,'--cache-dir',str(cache),*options],stdout=log,stderr=log)
     processes[i]=proc
     for _ in range(400):
         if os.path.ismount(mount):return mount
@@ -96,6 +98,50 @@ try:
     assert os.write(fd,b'close-commits')==13
     os.close(fd)  # deliberately no final fsync; check successful close publication
     assert (mounts[2]/'mid-sync').read_bytes()==expected+b'close-commits'
+    # Numeric metadata survives reopening from a different mount.
+    os.chmod(mounts[0]/'check',0o640)
+    os.utime(mounts[0]/'check',ns=(1_234_000_000_000,5_678_000_000_000))
+    info=(mounts[1]/'check').stat()
+    assert stat.S_IMODE(info.st_mode)==0o640 and info.st_mtime_ns==5_678_000_000_000
+    assert (info.st_uid,info.st_gid)==(os.geteuid(),os.getegid())
+    # Concurrent disjoint writes in one chunk both survive CAS retry.
+    d0=os.open(mounts[0]/'check',os.O_RDWR);d1=os.open(mounts[1]/'check',os.O_RDWR)
+    os.pwrite(d0,b'left',100);os.pwrite(d1,b'right',200);os.fsync(d0);os.fsync(d1);os.close(d0);os.close(d1)
+    with open(mounts[2]/'check','rb') as f:
+        f.seek(100);assert f.read(4)==b'left';f.seek(200);assert f.read(5)==b'right'
+    # A continuously open reader stays on its old snapshot through polling.
+    snapshot=os.open(mounts[0]/'check',os.O_RDONLY)
+    old=os.pread(snapshot,6,0);writer=os.open(mounts[1]/'check',os.O_RDWR)
+    os.pwrite(writer,b'newver',0);os.fsync(writer);os.close(writer)
+    time.sleep(1.2)
+    assert os.pread(snapshot,6,0)==old
+    with open(mounts[0]/'check','rb') as f:assert f.read(6)==b'newver'
+    os.close(snapshot)
+    # Two appenders: the first successful CAS wins even if it wrote later.
+    a0=os.open(mounts[0]/'check',os.O_WRONLY|os.O_APPEND);a1=os.open(mounts[1]/'check',os.O_WRONLY|os.O_APPEND)
+    before=(mounts[2]/'check').stat().st_size
+    os.write(a0,b'loser');os.write(a1,b'winner');os.fsync(a1)
+    try:os.fsync(a0)
+    except OSError as e:assert e.errno==errno.EAGAIN,e
+    else:raise AssertionError('stale append unexpectedly merged')
+    os.close(a1)
+    try:os.close(a0)
+    except OSError as e:assert e.errno==errno.EAGAIN,e
+    with open(mounts[2]/'check','rb') as f:f.seek(before);assert f.read()==b'winner'
+    if os.geteuid()==0:
+        permissions=mounts[0]/'permissions';permissions.mkdir();os.chmod(permissions,0o777)
+        def as_user(uid,gid,code,path):
+            command='import os,sys;os.setgroups([]);os.setgid(int(sys.argv[1]));os.setuid(int(sys.argv[2]));'+code
+            subprocess.run([sys.executable,'-c',command,str(gid),str(uid),str(path)],check=True)
+        owned=permissions/'owned'
+        as_user(1234,2000,'fd=os.open(sys.argv[3],os.O_CREAT|os.O_WRONLY,0o640);os.write(fd,b"secret");os.close(fd)',owned)
+        st=(mounts[1]/'permissions'/'owned').stat();assert (st.st_uid,st.st_gid,stat.S_IMODE(st.st_mode))==(1234,2000,0o640)
+        as_user(1235,2000,'assert open(sys.argv[3],"rb").read()==b"secret"',mounts[1]/'permissions'/'owned')
+        as_user(1235,2001,'\ntry:open(sys.argv[3],"rb");raise AssertionError("DAC allowed other user")\nexcept PermissionError:pass',mounts[2]/'permissions'/'owned')
+        groups='import os,sys;os.setgroups([3000]);os.setgid(2000);os.setuid(1234);os.chown(sys.argv[1],-1,3000)'
+        subprocess.run([sys.executable,'-c',groups,str(owned)],check=True)
+        assert (mounts[1]/'permissions'/'owned').stat().st_gid==3000
+        os.chown(owned,2345,3000);st=(mounts[2]/'permissions'/'owned').stat();assert (st.st_uid,st.st_gid)==(2345,3000)
     # Open snapshots: stale writer must report EAGAIN and leave the winner intact.
     f0=os.open(mounts[0]/'check',os.O_RDWR);f1=os.open(mounts[1]/'check',os.O_RDWR)
     os.pwrite(f0,b'winner',0);os.pwrite(f1,b'loser!',0);os.fsync(f0)
@@ -109,7 +155,7 @@ try:
     (mounts[0]/'check').unlink();assert not (mounts[1]/'check').exists()
     stop(0);mounts[0]=start(0)
     assert (mounts[0]/'nested'/'small').read_bytes()==b'hello'
-    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','close-commit']})
+    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','close-commit','disjoint-merge','append-first-CAS','snapshot-polling','numeric-metadata-permissions']})
     if a.benchmark:
         # Same-directory metadata contention, with each writer on a different mount.
         def small_files(i):

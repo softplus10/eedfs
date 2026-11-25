@@ -1,10 +1,11 @@
 //! Per-open-file write generations and bounded immutable-chunk upload pipeline.
-use super::{Error, Loaded, Piece, Result, Volume, pieces};
+use super::{Error, Loaded, MetadataUpdate, Piece, Result, Volume, pieces};
 use crate::{
     crypto::{self, naming, objects},
     format::{
         header::NamingConfig,
         inode::{self, ChunkRun, ChunkedContent, InodeContent},
+        metadata::{Metadata, Timestamp},
     },
     storage::s3::PutResult,
 };
@@ -12,6 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     os::unix::fs::FileExt,
+    path::PathBuf,
     sync::Arc,
 };
 use tokio::task::{JoinError, JoinSet};
@@ -39,9 +41,23 @@ pub struct FileSession {
     allocation: Option<[u8; 16]>,
     next_chunk: u64,
     changed: bool,
+    cache_dir: PathBuf,
+    pub metadata: Metadata,
+    attributes: MetadataUpdate,
+    attributes_actor: Option<(u32, u32)>,
+    ranges: Vec<(u64, u64)>,
+    append_generation: bool,
+    resized: bool,
 }
 impl FileSession {
-    pub(super) fn new(volume: Arc<Volume>, base: Loaded, file: File, size: u64) -> Self {
+    pub(super) fn new(
+        volume: Arc<Volume>,
+        base: Loaded,
+        file: File,
+        size: u64,
+        cache_dir: PathBuf,
+    ) -> Self {
+        let metadata = base.body.metadata.clone();
         Self {
             volume,
             base,
@@ -57,6 +73,13 @@ impl FileSession {
             allocation: None,
             next_chunk: 0,
             changed: false,
+            cache_dir,
+            metadata,
+            attributes: MetadataUpdate::default(),
+            attributes_actor: None,
+            ranges: Vec::new(),
+            append_generation: false,
+            resized: false,
         }
     }
     async fn ensure(&mut self, start: u64, end: u64) -> Result<()> {
@@ -133,6 +156,9 @@ impl FileSession {
             .checked_add(bytes.len() as u64)
             .ok_or(Error::TooLarge)?;
         self.check_size(end)?;
+        if self.ranges.len() >= 65536 {
+            return Err(Error::TooLarge);
+        }
         self.ensure(offset, end).await?;
         self.file.write_all_at(bytes, offset)?;
         for (i, p) in pieces(&self.base.body).iter().enumerate() {
@@ -145,6 +171,23 @@ impl FileSession {
         self.staged.retain(|_, s| {
             s.piece.offset >= end || s.piece.offset + u64::from(s.piece.len) <= offset
         });
+        self.append_generation |= end > self.base.body.size()?;
+        self.ranges.push((offset, end));
+        self.ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in self.ranges.drain(..) {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        self.ranges = merged;
+        self.metadata.mtime = Timestamp::now();
+        self.metadata.ctime = self.metadata.mtime;
+        self.attributes.mtime = None;
         self.size = self.size.max(end);
         self.changed = true;
         // Data was accepted locally. Any later pipeline failure must remain
@@ -171,6 +214,10 @@ impl FileSession {
         self.staged
             .retain(|_, s| s.piece.offset + u64::from(s.piece.len) <= size);
         self.size = size;
+        self.resized = true;
+        self.metadata.mtime = Timestamp::now();
+        self.metadata.ctime = self.metadata.mtime;
+        self.attributes.mtime = None;
         self.changed = true;
         Ok(())
     }
@@ -297,7 +344,9 @@ impl FileSession {
                 .await??;
                 match volume.connection.put(&name, bytes, None).await? {
                     PutResult::Applied(_) => Ok(()),
-                    PutResult::Conflict => Err(Error::Conflict),
+                    PutResult::Conflict => {
+                        Err(Error::Other("immutable chunk name collision".into()))
+                    }
                 }
             }
             .await;
@@ -343,7 +392,95 @@ impl FileSession {
     }
     /// Caller serializes this barrier with writes. FUSE holds the per-file
     /// session mutex through publication: later writes enter the next generation.
+    pub fn clear_setid(&mut self) {
+        let mode = self.metadata.mode & !0o6000;
+        if mode != self.metadata.mode {
+            self.metadata.mode = mode;
+            self.attributes.mode = Some(mode);
+            self.changed = true;
+        }
+    }
+    pub fn is_dirty(&self) -> bool {
+        self.changed
+    }
+    pub fn update_metadata(&mut self, update: &MetadataUpdate, actor: (u32, u32)) -> Result<()> {
+        if update.is_empty() {
+            return Ok(());
+        }
+        self.metadata = update.apply(&self.metadata, actor)?;
+        self.attributes.accumulate(update);
+        self.attributes_actor = Some(actor);
+        self.changed = true;
+        Ok(())
+    }
+    /// Append/resize conflicts retain first-CAS-wins. Ordinary disjoint byte
+    /// writes are three-way merged, including two edits inside the same chunk.
     pub async fn commit(&mut self) -> Result<()> {
+        for _ in 0..16 {
+            match self.commit_once().await {
+                Ok(()) => return Ok(()),
+                Err(Error::Conflict) if !self.resized => {
+                    let candidate = self.rebase().await?;
+                    *self = candidate;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
+    }
+    async fn rebase(&mut self) -> Result<Self> {
+        let latest = self.volume.load(self.base.body.id).await?;
+        let original_size = self.base.body.size()?;
+        let latest_size = latest.body.size()?;
+        if (self.append_generation && latest_size != original_size)
+            || (!self.ranges.is_empty() && latest_size < original_size)
+        {
+            return Err(Error::Conflict);
+        }
+        if latest.suite != self.base.suite || latest.key.0 != self.base.key.0 {
+            return Err(Error::Conflict);
+        }
+        if let Some(actor) = self.attributes_actor {
+            self.attributes.apply(&latest.body.metadata, actor)?;
+        }
+        let next_metadata = self.attributes.rebase(
+            &self.base.body.metadata,
+            &latest.body.metadata,
+            &self.metadata,
+        )?;
+        let mut original = self.volume.file(self.base.clone(), &self.cache_dir)?;
+        let mut candidate = self.volume.file(latest, &self.cache_dir)?;
+        for &(start, end) in &self.ranges {
+            if end > candidate.size && !self.append_generation {
+                return Err(Error::Conflict);
+            }
+            let mut offset = start;
+            while offset < end {
+                let len = (end - offset).min(1024 * 1024) as usize;
+                let comparable = original_size.saturating_sub(offset).min(len as u64) as usize;
+                if comparable > 0
+                    && original.read(offset, comparable).await?
+                        != candidate.read(offset, comparable).await?
+                {
+                    return Err(Error::Conflict);
+                }
+                let mut bytes = Zeroizing::new(vec![0; len]);
+                self.file.read_exact_at(&mut bytes, offset)?;
+                candidate.write(offset, &bytes).await?;
+                offset += len as u64;
+            }
+        }
+        candidate.metadata = next_metadata;
+        if !self.ranges.is_empty() && self.attributes.mtime.is_none() {
+            candidate.metadata.mtime = Timestamp::now();
+        }
+        candidate.metadata.ctime = Timestamp::now();
+        candidate.attributes = self.attributes.clone();
+        candidate.attributes_actor = self.attributes_actor;
+        candidate.changed = true;
+        Ok(candidate)
+    }
+    async fn commit_once(&mut self) -> Result<()> {
         self.poll_uploads();
         if self.changed
             && let Err(e) = self.seal_gaps(true).await
@@ -400,6 +537,7 @@ impl FileSession {
         let mut body = self.base.body.clone();
         body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
         body.content = content;
+        body.metadata = self.metadata.clone();
         let etag = self
             .volume
             .publish(&self.base, &body, Some(&self.base.etag))
@@ -414,6 +552,11 @@ impl FileSession {
         self.allocation = None;
         self.next_chunk = 0;
         self.changed = false;
+        self.ranges.clear();
+        self.attributes = MetadataUpdate::default();
+        self.attributes_actor = None;
+        self.append_generation = false;
+        self.resized = false;
         Ok(())
     }
 }

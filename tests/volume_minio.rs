@@ -206,3 +206,53 @@ async fn partial_fsync_append_keeps_previously_committed_chunk_references() {
     );
     std::fs::remove_dir(cache).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable real S3/MinIO bucket"]
+async fn three_clients_merge_disjoint_bytes_and_keep_reader_snapshot() {
+    let c = connection();
+    let prefix = prefix();
+    let password = b"merge test";
+    let first = Volume::format(c.clone(), prefix.clone(), password, 128 * 1024, 4)
+        .await
+        .unwrap();
+    let second = Volume::open(c.clone(), prefix.clone(), password, 128 * 1024, 4)
+        .await
+        .unwrap();
+    let third = Volume::open(c, prefix, password, 128 * 1024, 4)
+        .await
+        .unwrap();
+    let cache = std::env::temp_dir().join(format!("eedfs-merge-{}", std::process::id()));
+    let loaded = first
+        .create(first.root, "shared", inode::FILE)
+        .await
+        .unwrap();
+    let id = loaded.body.id;
+    let mut original = first.file(loaded, &cache).unwrap();
+    original.write(0, &vec![0; 400_000]).await.unwrap();
+    original.commit().await.unwrap();
+    let snapshot = third.load(id).await.unwrap();
+    let mut reader = third.file(snapshot.clone(), &cache).unwrap();
+    let pins = eedfs::volume::snapshots::Snapshots::new(third.clone());
+    pins.pin(&snapshot);
+    let mut a = first.file(first.load(id).await.unwrap(), &cache).unwrap();
+    let mut b = second.file(second.load(id).await.unwrap(), &cache).unwrap();
+    a.write(100, b"first").await.unwrap();
+    b.write(200, b"second").await.unwrap();
+    a.commit().await.unwrap();
+    b.commit().await.unwrap();
+    pins.poll_once().await;
+    assert!(pins.latest(id).unwrap().body.generation > snapshot.body.generation);
+    assert_eq!(reader.read(100, 5).await.unwrap(), vec![0; 5]);
+    let mut fresh = third.file(third.load(id).await.unwrap(), &cache).unwrap();
+    assert_eq!(fresh.read(100, 5).await.unwrap(), b"first");
+    assert_eq!(fresh.read(200, 6).await.unwrap(), b"second");
+    let mut a = first.file(first.load(id).await.unwrap(), &cache).unwrap();
+    let mut b = second.file(second.load(id).await.unwrap(), &cache).unwrap();
+    a.write(a.size, b"late").await.unwrap();
+    b.write(b.size, b"early").await.unwrap();
+    b.commit().await.unwrap();
+    assert!(matches!(a.commit().await, Err(Error::Conflict)));
+    pins.unpin(id);
+    std::fs::remove_dir(cache).unwrap();
+}

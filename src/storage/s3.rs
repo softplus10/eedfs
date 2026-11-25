@@ -114,6 +114,19 @@ pub struct StoredObject {
     pub etag: String,
 }
 impl Connection {
+    pub async fn head_etag(&self, key: &str) -> Result<String, ConnectionError> {
+        let response = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+        Ok(response
+            .e_tag()
+            .ok_or("S3 HEAD response lacks ETag")?
+            .to_owned())
+    }
     /// Explicit setup helper; normal format/mount operations never create buckets.
     pub async fn create_bucket(&self) -> Result<(), ConnectionError> {
         self.client

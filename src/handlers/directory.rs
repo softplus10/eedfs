@@ -37,17 +37,20 @@ impl S3Filesystem {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _owner: Owner,
+        mode: u32,
+        umask: u32,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
         let result = (|| {
             let p = self.node(parent)?;
             let name = name.to_str().ok_or(Error::Invalid)?;
-            let loaded = self
-                .runtime
-                .block_on(self.volume.create(p.id, name, inode::DIRECTORY))?;
+            let loaded = self.runtime.block_on(self.volume.create_with_metadata(
+                p.id,
+                name,
+                inode::DIRECTORY,
+                self.creation_metadata(p.id, owner, mode, umask, inode::DIRECTORY)?,
+            ))?;
             let ino = self.register(
                 parent,
                 &Entry {
@@ -56,7 +59,7 @@ impl S3Filesystem {
                     kind: inode::DIRECTORY,
                 },
             );
-            Ok::<_, Error>(self.attr(ino, inode::DIRECTORY, 0))
+            self.attr(ino, inode::DIRECTORY, 0, &loaded.body.metadata)
         })();
         match result {
             Ok(a) => reply.entry(&TTL, &a, Generation(0)),

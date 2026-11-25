@@ -20,6 +20,7 @@ fn body() -> InodeBody {
         id: [2; 16],
         kind: FILE,
         generation: 7,
+        metadata: Default::default(),
         content: InodeContent::Inline(b"hello".to_vec()),
         extensions: vec![],
     }
@@ -195,7 +196,7 @@ fn inode_aad_binds_filesystem_location_and_wrapped_key() {
 }
 
 #[test]
-fn v3_matches_independently_encoded_fixtures() {
+fn v4_matches_independently_encoded_fixtures() {
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()
             .map(|v| u8::from_str_radix(v, 16).unwrap())
@@ -203,11 +204,11 @@ fn v3_matches_independently_encoded_fixtures() {
     }
     assert_eq!(
         body().encode().unwrap(),
-        hex(include_str!("fixtures/inode-inline-v3.hex"))
+        hex(include_str!("fixtures/inode-inline-v4.hex"))
     );
     assert_eq!(
         object().encode().unwrap(),
-        hex(include_str!("fixtures/inode-object-v3.hex"))
+        hex(include_str!("fixtures/inode-object-v4.hex"))
     );
     let b = InodeBody {
         content: InodeContent::Chunks(chunks()),
@@ -215,7 +216,7 @@ fn v3_matches_independently_encoded_fixtures() {
     };
     assert_eq!(
         b.encode().unwrap(),
-        hex(include_str!("fixtures/inode-chunks-v3.hex"))
+        hex(include_str!("fixtures/inode-chunks-v4.hex"))
     );
     assert_eq!(
         InodeBody::decode(&hex(include_str!("fixtures/inode-inline-v1.hex"))),
@@ -250,4 +251,37 @@ fn previous_inode_version_is_rejected_and_lengths_need_no_file_maximum() {
         ..body()
     };
     assert_eq!(InodeBody::decode(&b.encode().unwrap()).unwrap(), b);
+}
+
+#[test]
+fn v3_is_explicitly_rejected_after_metadata_schema_change() {
+    let hex = |s: &str| {
+        s.split_whitespace()
+            .map(|v| u8::from_str_radix(v, 16).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        InodeBody::decode(&hex(include_str!("fixtures/inode-inline-v3.hex"))),
+        Err(FormatError::UnsupportedVersion(3))
+    );
+    assert_eq!(
+        InodeObject::decode(&hex(include_str!("fixtures/inode-object-v3.hex"))),
+        Err(FormatError::UnsupportedVersion(3))
+    );
+}
+#[test]
+fn metadata_and_pre_epoch_times_roundtrip_and_are_validated() {
+    use eedfs::format::metadata::{Metadata, Timestamp};
+    let time = std::time::UNIX_EPOCH - std::time::Duration::new(5, 123);
+    let ts = Timestamp::from_system_time(time).unwrap();
+    assert_eq!(ts.to_system_time().unwrap(), time);
+    let mut b = body();
+    b.metadata = Metadata::new(1000, 2000, 0o640);
+    b.metadata.mtime = ts;
+    assert_eq!(InodeBody::decode(&b.encode().unwrap()).unwrap(), b);
+    b.metadata.mode = 0o10000;
+    assert!(b.encode().is_err());
+    b.metadata.mode = 0o600;
+    b.metadata.atime.nanos = 1_000_000_000;
+    assert!(b.encode().is_err());
 }

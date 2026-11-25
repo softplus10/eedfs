@@ -8,3 +8,5 @@ pub mod inode;
 
 pub use common::MAX_OBJECT_EXTENSION;
 pub mod directory;
+
+pub mod metadata;

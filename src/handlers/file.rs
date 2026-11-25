@@ -3,8 +3,9 @@
 #![allow(clippy::too_many_arguments)]
 use super::state::*;
 use eedfs::{
+    format::metadata::Timestamp,
     format::{directory::Entry, inode},
-    volume::Error,
+    volume::{Error, MetadataUpdate},
 };
 use fuser::*;
 use std::ffi::OsStr;
@@ -17,7 +18,13 @@ impl S3Filesystem {
         _fh: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
-        match self.getattr_inner(ino) {
+        match if self.node(ino).is_ok_and(|n| n.kind == inode::FILE)
+            && let Some(fh) = _fh
+        {
+            self.getattr_handle(ino, fh)
+        } else {
+            self.getattr_inner(ino)
+        } {
             Ok(a) => reply.attr(&TTL, &a),
             Err(e) => reply.error(errno(e)),
         }
@@ -27,19 +34,22 @@ impl S3Filesystem {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _flags: i32,
+        mode: u32,
+        umask: u32,
+        flags: i32,
         _kill_suid_gid: bool,
-        _owner: Owner,
+        owner: Owner,
         reply: ReplyCreate,
     ) {
         let result = (|| {
             let p = self.node(parent)?;
             let name = name.to_str().ok_or(Error::Invalid)?;
-            let loaded = self
-                .runtime
-                .block_on(self.volume.create(p.id, name, inode::FILE))?;
+            let loaded = self.runtime.block_on(self.volume.create_with_metadata(
+                p.id,
+                name,
+                inode::FILE,
+                self.creation_metadata(p.id, owner, mode, umask, inode::FILE)?,
+            ))?;
             let ino = self.register(
                 parent,
                 &Entry {
@@ -48,8 +58,8 @@ impl S3Filesystem {
                     kind: inode::FILE,
                 },
             );
-            let fh = self.add_handle(ino, Some(loaded))?;
-            Ok::<_, Error>((self.attr(ino, inode::FILE, 0), fh))
+            let fh = self.add_handle(ino, Some(loaded), OpenFlags(flags))?;
+            Ok::<_, Error>((self.getattr_handle(ino, fh)?, fh))
         })();
         match result {
             Ok((a, fh)) => reply.created(&TTL, &a, Generation(0), fh, FopenFlags::FOPEN_DIRECT_IO),
@@ -64,7 +74,7 @@ impl S3Filesystem {
         _kill_suid_gid: bool,
         reply: ReplyOpen,
     ) {
-        match self.add_handle(ino, None) {
+        match self.add_handle(ino, None, _flags) {
             Ok(fh) => reply.opened(fh, FopenFlags::FOPEN_DIRECT_IO),
             Err(e) => reply.error(errno(e)),
         }
@@ -106,7 +116,15 @@ impl S3Filesystem {
             let s = self.handle(fh)?;
             let mut session = s.lock().unwrap();
             // Kernel supplies the append offset; cross-client append is still OCC.
+            let offset = if flags.0 & libc::O_APPEND != 0 {
+                session.size
+            } else {
+                offset
+            };
             let n = self.runtime.block_on(session.write(offset, data))?;
+            if n > 0 && _req.uid() != Some(0) {
+                session.clear_setid();
+            }
             if flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0 {
                 self.runtime.block_on(session.commit())?;
             }
@@ -153,7 +171,10 @@ impl S3Filesystem {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.state.lock().unwrap().handles.remove(&fh.0);
+        let removed = self.state.lock().unwrap().handles.remove(&fh.0);
+        if let Some(s) = removed {
+            self.snapshots.unpin(s.lock().unwrap().base.body.id);
+        }
         reply.ok();
     }
     pub(super) fn handle_setattr(
@@ -175,25 +196,54 @@ impl S3Filesystem {
         _kill_suid_gid: bool,
         reply: ReplyAttr,
     ) {
-        if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
+        if _flags.is_some() {
             reply.error(Errno::EOPNOTSUPP);
             return;
         }
         let result = (|| {
-            if let Some(size) = size {
-                let s = if let Some(fh) = fh {
-                    self.handle(fh)?
-                } else {
-                    self.session(ino)?
-                };
-                let mut session = s.lock().unwrap();
-                session.resize(size)?;
-                if fh.is_none() {
-                    self.runtime.block_on(session.commit())?;
+            let actor = super::permissions::actor(_req, gid)?;
+            let time = |t: Option<TimeOrNow>| -> Result<Option<Timestamp>, Error> {
+                Ok(match t {
+                    None => None,
+                    Some(TimeOrNow::Now) => Some(Timestamp::now()),
+                    Some(TimeOrNow::SpecificTime(t)) => Some(Timestamp::from_system_time(t)?),
+                })
+            };
+            let update = MetadataUpdate {
+                mode: mode.map(|m| (m & 0o7777) as u16),
+                uid,
+                gid,
+                atime: time(atime)?,
+                mtime: time(mtime)?,
+            };
+            let node = self.node(ino)?;
+            if node.kind == inode::DIRECTORY {
+                if size.is_some() {
+                    return Err(Error::Invalid);
                 }
-                return Ok(self.attr(ino, inode::FILE, session.size));
+                let loaded = self
+                    .runtime
+                    .block_on(self.volume.update_metadata(node.id, &update, actor))?;
+                return self.attr(ino, node.kind, 0, &loaded.body.metadata);
             }
-            self.getattr_inner(ino)
+            let s = if let Some(fh) = fh {
+                self.handle(fh)?
+            } else {
+                self.session(ino)?
+            };
+            let mut session = s.lock().unwrap();
+            if let Some(size) = size {
+                session.resize(size)?;
+                if _kill_suid_gid || actor.0 != 0 {
+                    session.clear_setid();
+                }
+            }
+            session.update_metadata(&update, actor)?;
+            if fh.is_none() || !update.is_empty() {
+                self.runtime.block_on(session.commit())?;
+                self.snapshots.published(&session.base);
+            }
+            self.attr(ino, inode::FILE, session.size, &session.metadata)
         })();
         match result {
             Ok(a) => reply.attr(&TTL, &a),

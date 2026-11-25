@@ -12,7 +12,7 @@ use super::data_chunk::MAX_CHUNK_PLAINTEXT;
 use codec::{bounded_bytes, serialize_bytes};
 use std::fmt;
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const FILE: u8 = 1;
 pub const DIRECTORY: u8 = 2;
 pub const MAX_INLINE_SIZE: usize = 64 * 1024;
@@ -31,13 +31,14 @@ pub struct InodeObject {
 }
 
 /// Minimal plaintext inode. Its contents must be encrypted before upload.
-/// No extent tree, directory-entry schema, POSIX attributes or separate DEK yet.
+/// Includes numeric ownership, permissions and basic timestamps; no extent tree.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InodeBody {
     pub id: [u8; 16],
     pub kind: u8,
     pub generation: u64,
     pub content: InodeContent,
+    pub metadata: super::metadata::Metadata,
     #[serde(deserialize_with = "bounded::<_, _, MAX_EXTENSIONS>")]
     pub extensions: Vec<Extension>,
 }
@@ -48,12 +49,13 @@ impl fmt::Debug for InodeBody {
             .field("kind", &self.kind)
             .field("generation", &self.generation)
             .field("content", &self.content)
+            .field("metadata", &self.metadata)
             .field("extension_count", &self.extensions.len())
             .finish()
     }
 }
 
-/// Persisted enum tags are fixed by schema v3: Inline=0, Chunks=1.
+/// Persisted enum tags are fixed by schema v4: Inline=0, Chunks=1.
 /// Reordering/inserting variants is a format change, not an implementation detail.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InodeContent {
@@ -198,6 +200,7 @@ impl InodeBody {
             return Err(FormatError::Invalid("inode kind"));
         }
         self.content.size()?;
+        self.metadata.validate()?;
         validate_extensions(&self.extensions)
     }
     pub fn size(&self) -> Result<u64> {

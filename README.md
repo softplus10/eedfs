@@ -9,7 +9,9 @@ file and directory operations, fsync commits and remount persistence. The older
 [S3/FUSE guide](docs/s3-fuse.md) for setup, supported behavior and limitations,
 and the [MinIO/filesystem benchmark](docs/benchmarks/s3-fuse-2026-11-24.md) for
 10 GiB and three-client results.
-Production POSIX semantics, same-file conflict merging and safe GC remain future work.
+Disjoint file writes merge, append uses first-CAS-wins, and open readers keep
+snapshots. Numeric uid/gid/mode/timestamps are persisted. Full POSIX semantics
+and safe GC remain future work. See the [policy contract](docs/concurrency-and-metadata.md).
 
 ## Development environment
 
@@ -120,7 +122,7 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 
 - [Header v4](docs/header-format.md): password keyslots, protected root inode ID
   and filesystem-wide inode naming configuration.
-- [Inode v3/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
+- [Inode v4/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
   encryption profile, inline data or variable-size chunk runs. Chunk bytes contain
   only nonce and ciphertext/tag; names derive from allocation ID and chunk index.
 - [Crypto profiles and key hierarchy](docs/crypto.md): XChaCha20-Poly1305,
@@ -130,7 +132,7 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 chunks in memory, including shared access using a separately granted inode key.
 The [S3 volume layer](docs/s3-fuse.md) connects these helpers to writable FUSE
 and encrypted inline directories. Old experimental formats are incompatible and
-rejected. POSIX attributes and encryption key lifecycle workflows remain future work. The cryptographic integration has not received a security audit.
+rejected. Basic POSIX attributes are included; encryption key lifecycle workflows remain future work. The cryptographic integration has not received a security audit.
 
 ## Source layout and writeback
 

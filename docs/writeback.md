@@ -1,8 +1,8 @@
 # File writeback contract
 
-This document fixes the current write/fsync/append/error/close contract. Other
-filesystem policies (same-file merging, namespace transactions, permissions, GC)
-remain separate design work. The persisted header/inode/chunk formats do not change.
+This document fixes the current write/fsync/append/error/close contract. The selected [concurrency and metadata policies](concurrency-and-metadata.md)
+extend this contract. Namespace transactions and GC remain separate work.
+Inode v4 now stores ownership, permissions and timestamps.
 
 ## write
 
@@ -30,12 +30,14 @@ the stronger synchronous-write behavior.
 
 ## fsync and write generations
 
-The FUSE adapter serializes operations using a per-file session mutex. The fsync
+The FUSE adapter serializes operations using a per-open-session mutex. The fsync
 cut is the moment it acquires that mutex: all previously accepted writes belong
-to its generation. A competing write waits and enters the next generation after
-the barrier completes. Different files have independent sessions and can progress.
+to its generation. A competing write through that same handle waits and enters
+the next generation after the barrier completes. Other opens use their own
+snapshots and synchronize through inode CAS/merge. Different opens have independent snapshots/sessions and can progress; duplicated
+descriptors of the same FUSE handle share the session.
 This implementation does not accept concurrent later writes into another buffer
-while the same file's fsync is waiting.
+while the same handle's fsync is waiting.
 
 For a successful fsync:
 
@@ -78,10 +80,11 @@ Background encryption/PUT errors are retained until fsync/flush reports failure.
 The barrier drains its upload tasks, including obsolete snapshots, and reports
 failure without publishing a new inode. After the error has been observed, an
 explicit retry can upload missing regions from the preserved local spool and
-reuse successful snapshots. An inode publication error also leaves successful
-staged chunks available for retry; it does not automatically rebase metadata.
+reuse successful snapshots. An inode publication error leaves staged chunks available. A stale CAS can
+rebase disjoint byte ranges against the latest snapshot; conflicting data,
+append size changes and conservative resize conflicts return EAGAIN.
 
-A stale inode ETag remains `EAGAIN`. Other I/O/encryption failures reach FUSE as
+An unmergeable stale inode ETag returns `EAGAIN`. Other I/O/encryption failures reach FUSE as
 errors. A failed operation can leave orphan objects, and a transport failure can
 have an ambiguous server-side outcome. No rollback or successful-notification
 claim is inferred from an error. The existing exact-byte PUT readback resolves

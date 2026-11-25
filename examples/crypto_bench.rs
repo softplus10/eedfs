@@ -75,6 +75,7 @@ fn main() {
         id: [2; 16],
         kind: FILE,
         generation: 1,
+        metadata: Default::default(),
         content: InodeContent::Chunks(ChunkedContent {
             naming: naming.clone(),
             runs: vec![ChunkRun {

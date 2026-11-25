@@ -26,6 +26,7 @@ pub enum Error {
     Invalid,
     TooLarge,
     NotEmpty,
+    Permission,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -62,7 +63,10 @@ impl From<tokio::task::JoinError> for Error {
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
+mod metadata;
 mod session;
+pub mod snapshots;
+pub use metadata::MetadataUpdate;
 pub use session::FileSession;
 
 pub struct Volume {
@@ -76,6 +80,7 @@ pub struct Volume {
     pub chunk_size: usize,
     pub parallelism: usize,
 }
+#[derive(Clone)]
 pub struct Loaded {
     pub body: InodeBody,
     pub key: Arc<SecretKey>,
@@ -127,6 +132,24 @@ impl Volume {
         chunk_size: usize,
         parallelism: usize,
     ) -> Result<Arc<Self>> {
+        Self::format_with_metadata(
+            connection,
+            prefix,
+            password,
+            chunk_size,
+            parallelism,
+            crate::format::metadata::Metadata::new(0, 0, 0o755),
+        )
+        .await
+    }
+    pub async fn format_with_metadata(
+        connection: Connection,
+        prefix: String,
+        password: &[u8],
+        chunk_size: usize,
+        parallelism: usize,
+        metadata: crate::format::metadata::Metadata,
+    ) -> Result<Arc<Self>> {
         Self::validate_policy(&prefix, chunk_size, parallelism)?;
         if connection
             .get(&format!("{prefix}header"), crate::format::header::MAX_SIZE)
@@ -154,7 +177,9 @@ impl Volume {
             chunk_size,
             parallelism,
         });
-        volume.create_inode(root, inode::DIRECTORY).await?;
+        volume
+            .create_inode(root, inode::DIRECTORY, metadata)
+            .await?;
         match volume
             .connection
             .put(&format!("{}header", volume.prefix), header.encode()?, None)
@@ -178,7 +203,7 @@ impl Volume {
             .ok_or(Error::Missing)?;
         let header = Header::decode(&stored.bytes)?;
         let unlocked = objects::unlock_header(&header, password, &header.keyslots[0].id)?;
-        Ok(Arc::new(Self {
+        let volume = Arc::new(Self {
             fs_id: header.filesystem_id,
             root: unlocked.config.root_inode,
             connection,
@@ -188,7 +213,9 @@ impl Volume {
             suite: header.protected.algorithm,
             chunk_size,
             parallelism,
-        }))
+        });
+        volume.load(volume.root).await?;
+        Ok(volume)
     }
     pub fn inode_name(&self, id: &[u8; 16]) -> Result<String> {
         Ok(format!(
@@ -203,6 +230,9 @@ impl Volume {
             self.prefix,
             naming::chunk(config, &self.fs_id, &piece.allocation, piece.index)?
         ))
+    }
+    pub async fn inode_etag(&self, id: [u8; 16]) -> Result<String> {
+        Ok(self.connection.head_etag(&self.inode_name(&id)?).await?)
     }
     pub async fn load(&self, id: [u8; 16]) -> Result<Loaded> {
         let name = self.inode_name(&id)?;
@@ -244,7 +274,12 @@ impl Volume {
             PutResult::Conflict => Err(Error::Conflict),
         }
     }
-    async fn create_inode(&self, id: [u8; 16], kind: u8) -> Result<Loaded> {
+    async fn create_inode(
+        &self,
+        id: [u8; 16],
+        kind: u8,
+        metadata: crate::format::metadata::Metadata,
+    ) -> Result<Loaded> {
         let content = if kind == inode::DIRECTORY {
             Directory::default().encode()?
         } else {
@@ -255,6 +290,7 @@ impl Volume {
                 id,
                 kind,
                 generation: 0,
+                metadata,
                 content: InodeContent::Inline(content),
                 extensions: vec![],
             },
@@ -304,6 +340,8 @@ impl Volume {
             let mut body = loaded.body.clone();
             body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
             body.content = InodeContent::Inline(directory.encode()?);
+            body.metadata.mtime = crate::format::metadata::Timestamp::now();
+            body.metadata.ctime = body.metadata.mtime;
             match self.publish(&loaded, &body, Some(&loaded.etag)).await {
                 Ok(_) => return Ok(()),
                 Err(Error::Conflict) => continue,
@@ -313,6 +351,29 @@ impl Volume {
         Err(Error::Conflict)
     }
     pub async fn create(&self, parent: [u8; 16], name: &str, kind: u8) -> Result<Loaded> {
+        self.create_with_metadata(
+            parent,
+            name,
+            kind,
+            crate::format::metadata::Metadata::new(
+                0,
+                0,
+                if kind == inode::DIRECTORY {
+                    0o755
+                } else {
+                    0o644
+                },
+            ),
+        )
+        .await
+    }
+    pub async fn create_with_metadata(
+        &self,
+        parent: [u8; 16],
+        name: &str,
+        kind: u8,
+        metadata: crate::format::metadata::Metadata,
+    ) -> Result<Loaded> {
         // Validate before creating an orphan object on invalid names.
         Directory {
             entries: vec![Entry {
@@ -322,7 +383,9 @@ impl Volume {
             }],
         }
         .encode()?;
-        let loaded = self.create_inode(crypto::random_array()?, kind).await?;
+        let loaded = self
+            .create_inode(crypto::random_array()?, kind, metadata)
+            .await?;
         self.edit_directory(
             parent,
             name,
@@ -334,6 +397,32 @@ impl Volume {
         )
         .await?;
         Ok(loaded)
+    }
+    pub async fn update_metadata(
+        &self,
+        id: [u8; 16],
+        update: &MetadataUpdate,
+        actor: (u32, u32),
+    ) -> Result<Loaded> {
+        for _ in 0..16 {
+            let mut loaded = self.load(id).await?;
+            if update.is_empty() {
+                return Ok(loaded);
+            }
+            let mut body = loaded.body.clone();
+            body.metadata = update.apply(&body.metadata, actor)?;
+            body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
+            match self.publish(&loaded, &body, Some(&loaded.etag)).await {
+                Ok(etag) => {
+                    loaded.body = body;
+                    loaded.etag = etag;
+                    return Ok(loaded);
+                }
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
     }
     pub async fn unlink(&self, parent: [u8; 16], name: &str) -> Result<()> {
         let entries = self.list(parent).await?;
@@ -368,6 +457,12 @@ impl Volume {
         if let InodeContent::Inline(bytes) = &loaded.body.content {
             file.write_all_at(bytes, 0)?;
         }
-        Ok(FileSession::new(self.clone(), loaded, file, size))
+        Ok(FileSession::new(
+            self.clone(),
+            loaded,
+            file,
+            size,
+            cache_dir.to_owned(),
+        ))
     }
 }

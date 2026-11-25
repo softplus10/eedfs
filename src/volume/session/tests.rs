@@ -112,6 +112,7 @@ impl Server {
                 id: [4; 16],
                 kind: FILE,
                 generation: 0,
+                metadata: Default::default(),
                 content: InodeContent::Inline(vec![]),
                 extensions: vec![],
             },
@@ -167,6 +168,10 @@ fn serve(mut stream: TcpStream, s: &State) -> std::io::Result<()> {
     reader.read_exact(&mut body)?;
     let is_inode = key == *s.inode.lock().unwrap();
     let (status, bytes, etag) = match method {
+        "HEAD" => match s.objects.lock().unwrap().get(&key).cloned() {
+            Some((_, e)) => (200, Vec::new(), Some(e)),
+            None => (404, Vec::new(), None),
+        },
         "GET" => match s.objects.lock().unwrap().get(&key).cloned() {
             Some((b, e)) => (200, b, Some(e)),
             None => (404, b"<Error><Code>NoSuchKey</Code></Error>".to_vec(), None),
@@ -380,4 +385,198 @@ async fn a_full_upload_window_backpressures_writes_without_publishing_the_inode(
         volume.load(id).await.unwrap().body.size().unwrap(),
         384 * 1024
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disjoint_writes_merge_inside_one_chunk_and_overlaps_conflict() {
+    let server = Server::new();
+    let (volume, mut original) = server.file().await;
+    let id = original.base.body.id;
+    original.write(0, &vec![0; 256 * 1024]).await.unwrap();
+    original.commit().await.unwrap();
+    let mut a = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    let mut b = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    a.write(100, b"aaaa").await.unwrap();
+    b.write(200, b"bbbb").await.unwrap();
+    a.commit().await.unwrap();
+    b.commit().await.unwrap();
+    let mut reader = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    assert_eq!(reader.read(100, 4).await.unwrap(), b"aaaa");
+    assert_eq!(reader.read(200, 4).await.unwrap(), b"bbbb");
+    let mut a = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    let mut b = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    a.write(100, b"1111").await.unwrap();
+    b.write(102, b"2222").await.unwrap();
+    a.commit().await.unwrap();
+    assert!(matches!(b.commit().await, Err(Error::Conflict)));
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inline_disjoint_merge_and_append_first_cas_wins() {
+    let server = Server::new();
+    let (volume, mut original) = server.file().await;
+    let id = original.base.body.id;
+    original.write(0, &[0; 100]).await.unwrap();
+    original.commit().await.unwrap();
+    let mut a = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    let mut b = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    a.write(0, b"one").await.unwrap();
+    b.write(10, b"two").await.unwrap();
+    b.commit().await.unwrap();
+    a.commit().await.unwrap();
+    let mut a = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    let mut b = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    a.write(100, b"loser").await.unwrap();
+    b.write(100, b"winner").await.unwrap();
+    b.commit().await.unwrap();
+    assert!(matches!(a.commit().await, Err(Error::Conflict)));
+    let mut reader = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    assert_eq!(reader.read(100, 10).await.unwrap(), b"winner");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_permissions_persist_and_merge_preserves_other_fields() {
+    use crate::volume::MetadataUpdate;
+    let server = Server::new();
+    let (volume, mut file) = server.file().await;
+    let id = file.base.body.id;
+    file.update_metadata(
+        &MetadataUpdate {
+            uid: Some(1000),
+            gid: Some(2000),
+            mode: Some(0o640),
+            ..Default::default()
+        },
+        (0, 0),
+    )
+    .unwrap();
+    file.commit().await.unwrap();
+    assert!(
+        file.update_metadata(
+            &MetadataUpdate {
+                mode: Some(0o777),
+                ..Default::default()
+            },
+            (1001, 2000)
+        )
+        .is_err()
+    );
+    assert!(
+        file.update_metadata(
+            &MetadataUpdate {
+                uid: Some(1001),
+                ..Default::default()
+            },
+            (1000, 2000)
+        )
+        .is_err()
+    );
+    file.update_metadata(
+        &MetadataUpdate {
+            mode: Some(0o600),
+            ..Default::default()
+        },
+        (1000, 2000),
+    )
+    .unwrap();
+    file.commit().await.unwrap();
+    let loaded = volume.load(id).await.unwrap();
+    assert_eq!(
+        (
+            loaded.body.metadata.uid,
+            loaded.body.metadata.gid,
+            loaded.body.metadata.mode
+        ),
+        (1000, 2000, 0o600)
+    );
+    file.write(0, &[0; 100]).await.unwrap();
+    file.commit().await.unwrap();
+    let mut writer = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    writer.write(0, b"data").await.unwrap();
+    volume
+        .update_metadata(
+            id,
+            &MetadataUpdate {
+                mode: Some(0o640),
+                ..Default::default()
+            },
+            (1000, 2000),
+        )
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+    let final_inode = volume.load(id).await.unwrap();
+    assert_eq!(final_inode.body.metadata.mode, 0o640);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn polling_advances_latest_cache_without_changing_open_snapshot() {
+    use crate::volume::snapshots::Snapshots;
+    let server = Server::new();
+    let (volume, mut writer) = server.file().await;
+    let id = writer.base.body.id;
+    writer.write(0, b"old").await.unwrap();
+    writer.commit().await.unwrap();
+    let loaded = volume.load(id).await.unwrap();
+    let registry = Snapshots::new(volume.clone());
+    registry.pin(&loaded);
+    let old = registry.latest(id).unwrap();
+    let mut reader = volume.file(loaded, &server.cache).unwrap();
+    writer.write(0, b"new").await.unwrap();
+    writer.commit().await.unwrap();
+    let reopened_before_poll = registry.open(id).await.unwrap();
+    assert!(reopened_before_poll.body.generation > old.body.generation);
+    registry.poll_once().await;
+    assert!(registry.latest(id).unwrap().body.generation > old.body.generation);
+    assert_eq!(reader.read(0, 3).await.unwrap(), b"old");
+    let mut reopened = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    assert_eq!(reopened.read(0, 3).await.unwrap(), b"new");
+    registry.unpin(id);
+    assert!(registry.latest(id).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_and_disjoint_existing_write_merge_but_two_appends_do_not() {
+    let server = Server::new();
+    let (volume, mut initial) = server.file().await;
+    let id = initial.base.body.id;
+    initial.write(0, &[0; 100]).await.unwrap();
+    initial.commit().await.unwrap();
+    let mut overwrite = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    let mut append = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    overwrite.write(0, b"new").await.unwrap();
+    append.write(100, b"tail").await.unwrap();
+    overwrite.commit().await.unwrap();
+    append.commit().await.unwrap();
+    let mut reader = volume
+        .file(volume.load(id).await.unwrap(), &server.cache)
+        .unwrap();
+    assert_eq!(reader.read(0, 3).await.unwrap(), b"new");
+    assert_eq!(reader.read(100, 4).await.unwrap(), b"tail");
 }
