@@ -63,7 +63,9 @@ impl From<tokio::task::JoinError> for Error {
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
+mod lease;
 mod metadata;
+pub use lease::Lease;
 mod session;
 pub mod snapshots;
 pub use metadata::MetadataUpdate;
@@ -256,6 +258,18 @@ impl Volume {
         body: &InodeBody,
         expected: Option<&str>,
     ) -> Result<String> {
+        // Lease holders write through Lease; ordinary callers cannot bypass it.
+        if body.lease.is_some() || loaded.body.lease.is_some() {
+            return Err(Error::Conflict);
+        }
+        self.publish_raw(loaded, body, expected).await
+    }
+    async fn publish_raw(
+        &self,
+        loaded: &Loaded,
+        body: &InodeBody,
+        expected: Option<&str>,
+    ) -> Result<String> {
         let name = self.inode_name(&body.id)?;
         let object = objects::seal_inode(
             &self.master,
@@ -291,6 +305,7 @@ impl Volume {
                 kind,
                 generation: 0,
                 metadata,
+                lease: None,
                 content: InodeContent::Inline(content),
                 extensions: vec![],
             },
@@ -319,7 +334,7 @@ impl Volume {
         entry: Option<Entry>,
     ) -> Result<()> {
         for _ in 0..16 {
-            let loaded = self.load(parent).await?;
+            let loaded = self.load_writable(parent).await?;
             if loaded.body.kind != inode::DIRECTORY {
                 return Err(Error::NotDirectory);
             }
@@ -405,7 +420,7 @@ impl Volume {
         actor: (u32, u32),
     ) -> Result<Loaded> {
         for _ in 0..16 {
-            let mut loaded = self.load(id).await?;
+            let mut loaded = self.load_writable(id).await?;
             if update.is_empty() {
                 return Ok(loaded);
             }

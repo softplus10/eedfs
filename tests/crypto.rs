@@ -112,6 +112,7 @@ fn password_header_inode_chunk_and_sharing_roundtrip_with_cow() {
             kind: FILE,
             generation: 1,
             metadata: Default::default(),
+            lease: None,
             content: InodeContent::Chunks(config),
             extensions: vec![],
         };

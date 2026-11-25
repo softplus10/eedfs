@@ -256,3 +256,42 @@ async fn three_clients_merge_disjoint_bytes_and_keep_reader_snapshot() {
     pins.unpin(id);
     std::fs::remove_dir(cache).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable real S3/MinIO bucket"]
+async fn directory_lease_excludes_other_clients_until_release() {
+    let c = connection();
+    let prefix = prefix();
+    let a = Volume::format(c.clone(), prefix.clone(), b"lease test", 128 * 1024, 4)
+        .await
+        .unwrap();
+    let b = Volume::open(c.clone(), prefix.clone(), b"lease test", 128 * 1024, 4)
+        .await
+        .unwrap();
+    let other = Volume::open(c, prefix, b"lease test", 128 * 1024, 4)
+        .await
+        .unwrap();
+    let (left, right) = tokio::join!(
+        a.acquire_directory_lease(a.root),
+        b.acquire_directory_lease(b.root)
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let mut holder = left.or(right).unwrap();
+    assert!(matches!(
+        other.create(other.root, "blocked", inode::FILE).await,
+        Err(Error::Conflict)
+    ));
+    a.renew_directory_lease(&mut holder, Duration::from_secs(30))
+        .await
+        .unwrap();
+    a.write_leased_directory(&mut holder, &Directory::default())
+        .await
+        .unwrap();
+    b.release_directory_lease(holder).await.unwrap();
+    other
+        .create(other.root, "after-release", inode::FILE)
+        .await
+        .unwrap();
+    assert_eq!(a.list(a.root).await.unwrap()[0].name, "after-release");
+    assert!(b.load(b.root).await.unwrap().body.lease.is_none());
+}

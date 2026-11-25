@@ -122,7 +122,7 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 
 - [Header v4](docs/header-format.md): password keyslots, protected root inode ID
   and filesystem-wide inode naming configuration.
-- [Inode v4/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
+- [Inode v5/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
   encryption profile, inline data or variable-size chunk runs. Chunk bytes contain
   only nonce and ciphertext/tag; names derive from allocation ID and chunk index.
 - [Crypto profiles and key hierarchy](docs/crypto.md): XChaCha20-Poly1305,
@@ -176,3 +176,7 @@ guarantee these features.
 ## License
 
 [The Unlicense](LICENSE). Dependencies retain their respective licenses.
+
+[Directory leases](docs/directory-leases.md) store an expiring holder in the encrypted
+inode and fence updates with its ETag. There is no operation ID or interrupted-operation
+recovery. The lease API is a foundation; rename/rmdir callbacks are not yet implemented.

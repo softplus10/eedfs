@@ -21,6 +21,7 @@ fn body() -> InodeBody {
         kind: FILE,
         generation: 7,
         metadata: Default::default(),
+        lease: None,
         content: InodeContent::Inline(b"hello".to_vec()),
         extensions: vec![],
     }
@@ -196,7 +197,7 @@ fn inode_aad_binds_filesystem_location_and_wrapped_key() {
 }
 
 #[test]
-fn v4_matches_independently_encoded_fixtures() {
+fn v5_matches_independently_encoded_fixtures() {
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()
             .map(|v| u8::from_str_radix(v, 16).unwrap())
@@ -204,11 +205,11 @@ fn v4_matches_independently_encoded_fixtures() {
     }
     assert_eq!(
         body().encode().unwrap(),
-        hex(include_str!("fixtures/inode-inline-v4.hex"))
+        hex(include_str!("fixtures/inode-inline-v5.hex"))
     );
     assert_eq!(
         object().encode().unwrap(),
-        hex(include_str!("fixtures/inode-object-v4.hex"))
+        hex(include_str!("fixtures/inode-object-v5.hex"))
     );
     let b = InodeBody {
         content: InodeContent::Chunks(chunks()),
@@ -216,7 +217,7 @@ fn v4_matches_independently_encoded_fixtures() {
     };
     assert_eq!(
         b.encode().unwrap(),
-        hex(include_str!("fixtures/inode-chunks-v4.hex"))
+        hex(include_str!("fixtures/inode-chunks-v5.hex"))
     );
     assert_eq!(
         InodeBody::decode(&hex(include_str!("fixtures/inode-inline-v1.hex"))),
@@ -284,4 +285,41 @@ fn metadata_and_pre_epoch_times_roundtrip_and_are_validated() {
     b.metadata.mode = 0o600;
     b.metadata.atime.nanos = 1_000_000_000;
     assert!(b.encode().is_err());
+}
+
+#[test]
+fn lease_is_directory_only_and_previous_inode_schema_is_rejected() {
+    use eedfs::format::metadata::Timestamp;
+    let mut b = body();
+    b.lease = Some(DirectoryLease {
+        owner: [8; 16],
+        expires_at: Timestamp {
+            seconds: 123,
+            nanos: 0,
+        },
+    });
+    assert!(b.encode().is_err());
+    b.kind = DIRECTORY;
+    assert_eq!(InodeBody::decode(&b.encode().unwrap()).unwrap(), b);
+    b.lease.as_mut().unwrap().owner = [0; 16];
+    assert!(b.encode().is_err());
+    b.lease.as_mut().unwrap().owner = [1; 16];
+    b.lease.as_mut().unwrap().expires_at.nanos = 1_000_000_000;
+    assert!(InodeBody::decode(&unchecked(b"EEDFSINB", &b)).is_err());
+    let old = include_str!("fixtures/inode-inline-v4.hex")
+        .split_whitespace()
+        .map(|v| u8::from_str_radix(v, 16).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        InodeBody::decode(&old),
+        Err(FormatError::UnsupportedVersion(4))
+    );
+    let old = include_str!("fixtures/inode-object-v4.hex")
+        .split_whitespace()
+        .map(|v| u8::from_str_radix(v, 16).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        InodeObject::decode(&old),
+        Err(FormatError::UnsupportedVersion(4))
+    );
 }

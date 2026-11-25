@@ -1,15 +1,15 @@
-# Inode v4 and data-chunk v2 formats
+# Inode v5 and data-chunk v2 formats
 
-Experimental; inode v1–v3 are rejected. Inode v4 adds numeric ownership,
-permissions and timestamps. Header is independently versioned at v4.
+Experimental; inode v1–v4 are rejected. Inode v5 adds an optional encrypted
+directory lease alongside numeric ownership, permissions and timestamps. Header is independently versioned at v4.
 Code lives in `src/format/{header,inode,data_chunk}.rs`. The experimental
 [S3/FUSE layer](s3-fuse.md) implements inline directory entries and conditional
-object publication. POSIX metadata and multi-object transactions remain deferred.
+object publication and basic POSIX metadata. Multi-object transactions remain deferred.
 
 ## Inode envelope
 
 `EEDFSINO` + the 16-byte framing convention in [header format](header-format.md),
-version 4, followed by canonical Postcard:
+version 5, followed by canonical Postcard:
 
 ```
 InodeObject {
@@ -24,15 +24,17 @@ Distinct body and chunk keys are derived from that inode key using HKDF. Wrappin
 and body profiles are independently described by the envelope. Creation currently
 uses the selected AEAD for both. Both supported AEADs are allowed for wrapping.
 
-Decrypted body has its own `EEDFSINB` frame, version 4:
+Decrypted body has its own `EEDFSINB` frame, version 5:
 
 ```
 InodeBody {
   id: [u8;16], kind:u8, generation:u64,
   content: InodeContent,
   metadata: Metadata,
+  lease: Option<DirectoryLease>,
   extensions: Vec<Extension>,
 }
+DirectoryLease { owner:[u8;16], expires_at:Timestamp }
 InodeContent = Inline(Vec<u8>) | Chunks(ChunkedContent)
 ChunkedContent {
   naming: NamingConfig,             // per-file secret, not the global naming key
@@ -85,9 +87,9 @@ AAD is raw domain then canonical Postcard tuple. Version is u16; expected chunk
 plaintext length is u32. `metadata` in these contexts excludes the region's own
 ciphertext. Every context binds the trusted filesystem ID and exact S3 key.
 
-- `EEDFS/inode-key\0`: `(4, fs_id, object_key,
+- `EEDFS/inode-key\0`: `(5, fs_id, object_key,
   (wrapping_algorithm, wrapping_nonce, extensions))`.
-- `EEDFS/inode-body\0`: `(4, fs_id, object_key,
+- `EEDFS/inode-body\0`: `(5, fs_id, object_key,
   (full_wrapped_key_region, body_algorithm, body_nonce, extensions))`.
 - `EEDFS/data-chunk\0`: `(2, fs_id, object_key,
   (common_algorithm, chunk_nonce, expected_plaintext_length))`.
@@ -103,7 +105,10 @@ then publish the inode with ETag `If-Match`. On conflict, rebase/merge while
 retaining staged chunks. Raw S3 ETags are concurrency tokens, not AEAD integrity
 checks. The S3/FUSE prototype implements conditional publication and parent-directory
 CAS retry. Disjoint same-file writes are merged; append conflicts use first-CAS-wins.
-Crash recovery and GC remain future work.
+GC remains future work. Interrupted namespace operations are not automatically recovered.
 
 Metadata fields and snapshot/merge policies are defined in
 [concurrency and metadata](concurrency-and-metadata.md).
+
+Directory-only lease acquisition and ETag fencing are described in
+[directory leases](directory-leases.md). No automatic operation recovery is implemented.

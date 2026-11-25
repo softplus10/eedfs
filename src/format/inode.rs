@@ -12,7 +12,7 @@ use super::data_chunk::MAX_CHUNK_PLAINTEXT;
 use codec::{bounded_bytes, serialize_bytes};
 use std::fmt;
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 pub const FILE: u8 = 1;
 pub const DIRECTORY: u8 = 2;
 pub const MAX_INLINE_SIZE: usize = 64 * 1024;
@@ -39,6 +39,7 @@ pub struct InodeBody {
     pub generation: u64,
     pub content: InodeContent,
     pub metadata: super::metadata::Metadata,
+    pub lease: Option<DirectoryLease>,
     #[serde(deserialize_with = "bounded::<_, _, MAX_EXTENSIONS>")]
     pub extensions: Vec<Extension>,
 }
@@ -50,12 +51,21 @@ impl fmt::Debug for InodeBody {
             .field("generation", &self.generation)
             .field("content", &self.content)
             .field("metadata", &self.metadata)
+            .field("lease", &self.lease)
             .field("extension_count", &self.extensions.len())
             .finish()
     }
 }
 
-/// Persisted enum tags are fixed by schema v4: Inline=0, Chunks=1.
+/// An inode-local namespace lease. The enclosing object's ETag fences each write.
+/// No operation identifier, transaction log, or automatic recovery is persisted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryLease {
+    pub owner: [u8; 16],
+    pub expires_at: super::metadata::Timestamp,
+}
+
+/// Persisted enum tags are fixed by schema v5: Inline=0, Chunks=1.
 /// Reordering/inserting variants is a format change, not an implementation detail.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InodeContent {
@@ -198,6 +208,12 @@ impl InodeBody {
     fn validate(&self) -> Result<()> {
         if self.kind != FILE && self.kind != DIRECTORY {
             return Err(FormatError::Invalid("inode kind"));
+        }
+        if let Some(lease) = &self.lease {
+            if self.kind != DIRECTORY || lease.owner == [0; 16] {
+                return Err(FormatError::Invalid("directory lease"));
+            }
+            lease.expires_at.to_system_time()?;
         }
         self.content.size()?;
         self.metadata.validate()?;

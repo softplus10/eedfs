@@ -113,6 +113,7 @@ impl Server {
                 kind: FILE,
                 generation: 0,
                 metadata: Default::default(),
+                lease: None,
                 content: InodeContent::Inline(vec![]),
                 extensions: vec![],
             },
@@ -579,4 +580,127 @@ async fn append_and_disjoint_existing_write_merge_but_two_appends_do_not() {
         .unwrap();
     assert_eq!(reader.read(0, 3).await.unwrap(), b"new");
     assert_eq!(reader.read(100, 4).await.unwrap(), b"tail");
+}
+
+#[tokio::test]
+async fn directory_lease_blocks_mutations_and_can_be_renewed_and_released() {
+    let server = Server::new();
+    let (v, _) = server.file().await;
+    let dir = v
+        .create_inode([9; 16], inode::DIRECTORY, Default::default())
+        .await
+        .unwrap();
+    let id = dir.body.id;
+    let mut lease = v.acquire_directory_lease(id).await.unwrap();
+    assert!(matches!(
+        v.acquire_directory_lease(id).await,
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(
+        v.create(id, "blocked", inode::FILE).await,
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(
+        v.update_metadata(
+            id,
+            &MetadataUpdate {
+                mode: Some(0o700),
+                ..Default::default()
+            },
+            (0, 0)
+        )
+        .await,
+        Err(Error::Conflict)
+    ));
+    let original = lease.inode().etag.clone();
+    v.renew_directory_lease(&mut lease, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_ne!(lease.inode().etag, original);
+    v.write_leased_directory(&mut lease, &crate::format::directory::Directory::default())
+        .await
+        .unwrap();
+    v.release_directory_lease(lease).await.unwrap();
+    v.create(id, "allowed", inode::FILE).await.unwrap();
+    assert!(v.load(id).await.unwrap().body.lease.is_none());
+}
+
+#[tokio::test]
+async fn expired_lease_takeover_fences_stale_holder_without_recovering_its_changes() {
+    let server = Server::new();
+    let (v, _) = server.file().await;
+    let dir = v
+        .create_inode([9; 16], inode::DIRECTORY, Default::default())
+        .await
+        .unwrap();
+    let mut old = v.acquire_directory_lease(dir.body.id).await.unwrap();
+    // Persist an already expired lease, without waiting for wall-clock expiry.
+    // The local old handle still believes its original lease is valid. This
+    // exercises fencing independently of the owner's local expiration check.
+    let mut expired = old.inode().body.clone();
+    expired.lease.as_mut().unwrap().expires_at = Timestamp::default();
+    v.publish_raw(old.inode(), &expired, Some(&old.inode().etag))
+        .await
+        .unwrap();
+    let mut next = v.acquire_directory_lease(dir.body.id).await.unwrap();
+    assert_ne!(
+        old.inode().body.lease.as_ref().unwrap().owner,
+        next.inode().body.lease.as_ref().unwrap().owner
+    );
+    let directory = crate::format::directory::Directory::default();
+    assert!(matches!(
+        v.write_leased_directory(&mut old, &directory).await,
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(
+        v.renew_directory_lease(&mut old, Duration::from_secs(30))
+            .await,
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(
+        v.release_directory_lease(old).await,
+        Err(Error::Conflict)
+    ));
+    v.write_leased_directory(&mut next, &directory)
+        .await
+        .unwrap();
+    v.release_directory_lease(next).await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_edit_retires_expired_lease_and_acquisition_race_has_one_winner() {
+    let server = Server::new();
+    let (v, _) = server.file().await;
+    let dir = v
+        .create_inode([9; 16], inode::DIRECTORY, Default::default())
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        v.acquire_directory_lease(dir.body.id),
+        v.acquire_directory_lease(dir.body.id)
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    let lease = a.or(b).unwrap();
+    let mut expired = lease.inode().body.clone();
+    expired.lease.as_mut().unwrap().expires_at = Timestamp::default();
+    v.publish_raw(lease.inode(), &expired, Some(&lease.inode().etag))
+        .await
+        .unwrap();
+    v.create(dir.body.id, "after-expiry", inode::FILE)
+        .await
+        .unwrap();
+    assert!(v.load(dir.body.id).await.unwrap().body.lease.is_none());
+    assert!(matches!(
+        v.release_directory_lease(lease).await,
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(
+        v.acquire_directory_lease([4; 16]).await,
+        Err(Error::NotDirectory)
+    ));
+    assert!(matches!(
+        v.acquire_directory_lease_for(dir.body.id, Duration::from_secs(1))
+            .await,
+        Err(Error::Invalid)
+    ));
 }

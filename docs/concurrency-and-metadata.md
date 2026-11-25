@@ -1,6 +1,6 @@
 # File concurrency, snapshots and numeric permissions
 
-This fixes the four selected policies. Namespace transactions, locks, mmap,
+This fixes the four selected policies. Namespace transactions, application file locks, mmap,
 large indexes and GC remain separate work.
 
 ## Disjoint writes
@@ -63,7 +63,7 @@ already opened file.
 
 ## Persisted metadata and permissions
 
-Inode format **v4** adds encrypted `Metadata` to the inode body:
+Inode format **v5** retains encrypted `Metadata` in the inode body:
 
 ```
 Metadata {
@@ -111,7 +111,7 @@ storage-capacity reporting, rollback protection and reclamation are not added.
 ## Compatibility and validation
 
 Header v4, directory payload v1 and data chunks v2 are unchanged. Inode envelopes
-and bodies move from v3 to v4 so older clients cannot silently ignore permissions.
+and bodies are v5 so older clients cannot silently ignore directory lease state.
 The prototype rejects earlier inode versions; no automatic migration is provided.
 Recreate disposable older test volumes. Opening validates the root inode before
 mounting so unsupported versions fail early.
@@ -122,3 +122,10 @@ preservation and snapshot cache polling. Real MinIO tests and three mounted
 clients verify the same policies and metadata persistence. Local root-run mounted
 checks additionally switch numeric users/groups, validate DAC denial, owner/group
 reporting and supplementary-group chgrp without a cross-client identity lookup.
+
+## Namespace policy update
+
+The selected rename, unlink, link and sparse policies and the implemented
+inode-local lease API are recorded in [directory leases](directory-leases.md).
+No operation ID or interrupted-operation recovery is used. The lease primitive
+does not yet expose rename/rmdir/hard-link/symlink callbacks or sparse extents.
