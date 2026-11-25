@@ -4,14 +4,13 @@ use crate::{
     format::{
         directory::{Directory, Entry},
         header::{Algorithm, Header, NamingConfig},
-        inode::{self, ChunkRun, ChunkedContent, InodeBody, InodeContent, InodeObject},
+        inode::{self, InodeBody, InodeContent, InodeObject},
     },
-    s3::{Connection, ConnectionError, PutResult},
+    storage::s3::{Connection, ConnectionError, PutResult},
 };
 use std::{
-    collections::BTreeSet,
     fmt,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     os::unix::fs::{FileExt, OpenOptionsExt},
     path::Path,
     sync::Arc,
@@ -63,7 +62,8 @@ impl From<tokio::task::JoinError> for Error {
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
-type ReadTasks = tokio::task::JoinSet<Result<(usize, Piece, zeroize::Zeroizing<Vec<u8>>)>>;
+mod session;
+pub use session::FileSession;
 
 pub struct Volume {
     pub fs_id: [u8; 16],
@@ -368,225 +368,6 @@ impl Volume {
         if let InodeContent::Inline(bytes) = &loaded.body.content {
             file.write_all_at(bytes, 0)?;
         }
-        Ok(FileSession {
-            volume: self.clone(),
-            base: loaded,
-            file,
-            size,
-            visible_size: size,
-            cached: BTreeSet::new(),
-            dirty: BTreeSet::new(),
-            changed: false,
-        })
-    }
-}
-
-pub struct FileSession {
-    volume: Arc<Volume>,
-    pub base: Loaded,
-    file: File,
-    pub size: u64,
-    visible_size: u64,
-    cached: BTreeSet<usize>,
-    dirty: BTreeSet<u64>,
-    changed: bool,
-}
-impl FileSession {
-    async fn ensure(&mut self, start: u64, end: u64) -> Result<()> {
-        let InodeContent::Chunks(config) = &self.base.body.content else {
-            return Ok(());
-        };
-        let naming = config.naming.clone();
-        let all = pieces(&self.base.body);
-        let selected: Vec<_> = all
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.offset < end && p.offset + u64::from(p.len) > start)
-            .map(|(i, _)| i)
-            .collect();
-        let mut wanted = BTreeSet::new();
-        for i in selected {
-            for (j, piece) in all.iter().enumerate().skip(i).take(4) {
-                if !self.cached.contains(&j) && piece.offset < self.visible_size {
-                    wanted.insert(j);
-                }
-            }
-        }
-        let mut tasks = tokio::task::JoinSet::new();
-        for i in wanted {
-            let piece = all[i].clone();
-            let name = self.volume.chunk_name(&naming, &piece)?;
-            let key = self.base.key.clone();
-            let suite = self.base.suite.clone();
-            let volume = self.volume.clone();
-            tasks.spawn(async move {
-                let bytes = volume
-                    .connection
-                    .get(&name, piece.len as usize + 64)
-                    .await?
-                    .ok_or(Error::Missing)?
-                    .bytes;
-                let plaintext =
-                    objects::open_chunk(&key, &volume.fs_id, &name, &suite, piece.len, &bytes)?;
-                Ok::<_, Error>((i, piece, plaintext))
-            });
-            if tasks.len() >= self.volume.parallelism {
-                self.receive_read(&mut tasks).await?;
-            }
-        }
-        while !tasks.is_empty() {
-            self.receive_read(&mut tasks).await?;
-        }
-        Ok(())
-    }
-    async fn receive_read(&mut self, tasks: &mut ReadTasks) -> Result<()> {
-        let (i, p, bytes) = tasks.join_next().await.ok_or(Error::Invalid)???;
-        let len = (self.visible_size - p.offset).min(u64::from(p.len)) as usize;
-        self.file.write_all_at(&bytes[..len], p.offset)?;
-        self.cached.insert(i);
-        Ok(())
-    }
-    pub async fn read(&mut self, offset: u64, size: usize) -> Result<Vec<u8>> {
-        let len = self.size.saturating_sub(offset).min(size as u64) as usize;
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        self.ensure(offset, offset + len as u64).await?;
-        let mut bytes = vec![0; len];
-        self.file.read_exact_at(&mut bytes, offset)?;
-        Ok(bytes)
-    }
-    pub async fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or(Error::TooLarge)?;
-        self.check_size(end)?;
-        self.ensure(offset, end).await?;
-        self.file.write_all_at(bytes, offset)?;
-        for index in
-            offset / self.volume.chunk_size as u64..=(end - 1) / self.volume.chunk_size as u64
-        {
-            self.dirty.insert(index);
-        }
-        self.size = self.size.max(end);
-        self.changed = true;
-        Ok(bytes.len())
-    }
-    fn check_size(&self, size: u64) -> Result<()> {
-        if size.div_ceil(self.volume.chunk_size as u64) > inode::MAX_CHUNK_REFERENCES as u64 {
-            Err(Error::TooLarge)
-        } else {
-            Ok(())
-        }
-    }
-    pub fn resize(&mut self, size: u64) -> Result<()> {
-        self.check_size(size)?;
-        if size == self.size {
-            return Ok(());
-        }
-        let from = size.min(self.size) / self.volume.chunk_size as u64;
-        for i in from..size.div_ceil(self.volume.chunk_size as u64) {
-            self.dirty.insert(i);
-        }
-        self.dirty
-            .retain(|i| *i < size.div_ceil(self.volume.chunk_size as u64));
-        self.visible_size = self.visible_size.min(size);
-        self.file.set_len(size)?;
-        self.size = size;
-        self.changed = true;
-        Ok(())
-    }
-    pub async fn commit(&mut self) -> Result<()> {
-        if !self.changed {
-            return Ok(());
-        }
-        let content = if self.size <= inode::MAX_INLINE_SIZE as u64 {
-            InodeContent::Inline(self.read(0, self.size as usize).await?)
-        } else {
-            let naming = match &self.base.body.content {
-                InodeContent::Chunks(c) => c.naming.clone(),
-                _ => NamingConfig {
-                    algorithm: naming::algorithm()?,
-                    key: crypto::random_array()?,
-                },
-            };
-            let previous = pieces(&self.base.body);
-            let allocation = crypto::random_array()?;
-            let mut next = Vec::new();
-            let mut tasks = tokio::task::JoinSet::new();
-            for index in 0..self.size.div_ceil(self.volume.chunk_size as u64) {
-                let offset = index * self.volume.chunk_size as u64;
-                let len = (self.size - offset).min(self.volume.chunk_size as u64) as u32;
-                if !self.dirty.contains(&index)
-                    && let Some(p) = previous.iter().find(|p| p.offset == offset && p.len == len)
-                {
-                    next.push(p.clone());
-                    continue;
-                }
-                let plain = self.read(offset, len as usize).await?;
-                let piece = Piece {
-                    offset,
-                    len,
-                    allocation,
-                    index,
-                };
-                let name = self.volume.chunk_name(&naming, &piece)?;
-                let volume = self.volume.clone();
-                let key = self.base.key.clone();
-                let suite = self.base.suite.clone();
-                tasks.spawn(async move {
-                    let fs = volume.fs_id;
-                    let encrypt_name = name.clone();
-                    let bytes = tokio::task::spawn_blocking(move || {
-                        objects::seal_chunk(&key, &fs, &encrypt_name, &suite, &plain)
-                    })
-                    .await??;
-                    match volume.connection.put(&name, bytes, None).await? {
-                        PutResult::Applied(_) => Ok::<_, Error>(()),
-                        PutResult::Conflict => Err(Error::Conflict),
-                    }
-                });
-                next.push(piece);
-                if tasks.len() >= self.volume.parallelism {
-                    tasks.join_next().await.ok_or(Error::Invalid)???;
-                }
-            }
-            while let Some(result) = tasks.join_next().await {
-                result??;
-            }
-            let mut runs: Vec<ChunkRun> = Vec::new();
-            for p in next {
-                if let Some(last) = runs.last_mut()
-                    && last.allocation_id == p.allocation
-                    && last.first_chunk + last.plaintext_lengths.len() as u64 == p.index
-                {
-                    last.plaintext_lengths.push(p.len);
-                    continue;
-                }
-                runs.push(ChunkRun {
-                    allocation_id: p.allocation,
-                    first_chunk: p.index,
-                    plaintext_lengths: vec![p.len],
-                });
-            }
-            InodeContent::Chunks(ChunkedContent { naming, runs })
-        };
-        let mut body = self.base.body.clone();
-        body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
-        body.content = content;
-        let etag = self
-            .volume
-            .publish(&self.base, &body, Some(&self.base.etag))
-            .await?;
-        self.base.body = body;
-        self.base.etag = etag;
-        self.visible_size = self.size;
-        self.cached.clear();
-        self.dirty.clear();
-        self.changed = false;
-        Ok(())
+        Ok(FileSession::new(self.clone(), loaded, file, size))
     }
 }

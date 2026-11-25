@@ -1,5 +1,4 @@
-mod fs;
-mod s3fs;
+mod handlers;
 
 use std::error::Error;
 use std::os::unix::fs::MetadataExt;
@@ -7,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use eedfs::s3::{Connection, ConnectionConfig, ConnectionError};
+use eedfs::storage::s3::{Connection, ConnectionConfig, ConnectionError};
 use fuser::{Config, MountOption};
 
 #[derive(Parser)]
@@ -171,7 +170,7 @@ fn main() -> Result<(), ConnectionError> {
                 MountOption::NoSuid,
             ];
             fuser::mount(
-                s3fs::S3Filesystem::new(volume, runtime, cache, metadata.uid(), metadata.gid()),
+                handlers::S3Filesystem::new(volume, runtime, cache, metadata.uid(), metadata.gid()),
                 mountpoint,
                 &config,
             )?;
@@ -234,7 +233,7 @@ fn mount(mountpoint: PathBuf) -> Result<(), Box<dyn Error + Send + Sync>> {
         mountpoint.display()
     );
     fuser::mount(
-        fs::DevFilesystem::new(metadata.uid(), metadata.gid()),
+        handlers::development::DevFilesystem::new(metadata.uid(), metadata.gid()),
         mountpoint,
         &config,
     )?;

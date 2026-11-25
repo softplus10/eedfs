@@ -2,7 +2,7 @@
 use clap::Parser;
 use eedfs::{
     crypto,
-    s3::{Connection, ConnectionConfig, PutResult},
+    storage::s3::{Connection, ConnectionConfig, PutResult},
 };
 use std::{
     sync::Arc,

@@ -199,3 +199,29 @@ impl Connection {
         }
     }
 }
+
+#[cfg(test)]
+impl Connection {
+    pub(crate) fn test_client(endpoint: &str) -> Self {
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "unit test"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(10))
+                    .build(),
+            )
+            .build();
+        Self {
+            client: Client::from_conf(config),
+            bucket: "test".into(),
+        }
+    }
+}

@@ -94,7 +94,7 @@ can indicate a missing bucket or insufficient access and are not always
 specific enough to distinguish the two.
 
 `--timeout-seconds` sets an overall deadline (default: 30 seconds), including
-SDK retries. The reusable `s3::Connection` shares an SDK HTTP connection pool
+SDK retries. The reusable `storage::s3::Connection` shares an SDK HTTP connection pool
 across clones. Its operation timeout bounds individual bucket checks.
 
 ## Validation
@@ -131,6 +131,17 @@ chunks in memory, including shared access using a separately granted inode key.
 The [S3 volume layer](docs/s3-fuse.md) connects these helpers to writable FUSE
 and encrypted inline directories. Old experimental formats are incompatible and
 rejected. POSIX attributes and encryption key lifecycle workflows remain future work. The cryptographic integration has not received a security audit.
+
+## Source layout and writeback
+
+FUSE wiring lives in `src/handlers/`, separated into file/directory callbacks and
+adapter state. `src/volume/` owns file buffers, write generations and inode commits;
+`src/storage/` owns S3 I/O. `src/format/` and `src/crypto/` remain independent
+format and cryptographic implementation groups.
+
+The [writeback contract](docs/writeback.md) defines background upload during writes,
+partial fsync and append, error delivery and close-time commit. No stored format
+change is required. Public S3 transport types now live under `eedfs::storage::s3`.
 
 ## Local crypto benchmark
 

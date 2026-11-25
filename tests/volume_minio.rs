@@ -5,7 +5,7 @@ use eedfs::{
         directory::{Directory, Entry},
         inode,
     },
-    s3::{Connection, ConnectionConfig, PutResult},
+    storage::s3::{Connection, ConnectionConfig, PutResult},
     volume::{Error, Volume},
 };
 use std::{sync::Arc, time::Duration};
@@ -163,5 +163,46 @@ async fn persistence_cow_sparse_truncate_conflicts_and_directory_merge() {
         .unwrap()
         .unwrap();
     assert!(!root.bytes.windows(8).any(|w| w == b"client-0"));
+    std::fs::remove_dir(cache).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable real S3/MinIO bucket"]
+async fn partial_fsync_append_keeps_previously_committed_chunk_references() {
+    let volume = Volume::format(connection(), prefix(), b"append test", 8 * 1024 * 1024, 4)
+        .await
+        .unwrap();
+    let cache = std::env::temp_dir().join(format!("eedfs-append-{}", std::process::id()));
+    let loaded = volume
+        .create(volume.root, "append", inode::FILE)
+        .await
+        .unwrap();
+    let id = loaded.body.id;
+    let mut file = volume.file(loaded, &cache).unwrap();
+    let first = vec![1; 3 * 1024 * 1024];
+    file.write(0, &first).await.unwrap();
+    assert_eq!(volume.load(id).await.unwrap().body.size().unwrap(), 0);
+    file.commit().await.unwrap();
+    let inode::InodeContent::Chunks(before) = volume.load(id).await.unwrap().body.content else {
+        panic!()
+    };
+    assert_eq!(before.runs[0].plaintext_lengths, vec![3 * 1024 * 1024]);
+    let second = vec![2; 2 * 1024 * 1024];
+    file.write(first.len() as u64, &second).await.unwrap();
+    assert_eq!(
+        volume.load(id).await.unwrap().body.size().unwrap(),
+        first.len() as u64
+    );
+    file.commit().await.unwrap();
+    let inode::InodeContent::Chunks(after) = volume.load(id).await.unwrap().body.content else {
+        panic!()
+    };
+    assert_eq!(&after.runs[..before.runs.len()], &before.runs);
+    assert_eq!(after.runs[1].plaintext_lengths, vec![2 * 1024 * 1024]);
+    let mut reader = volume.file(volume.load(id).await.unwrap(), &cache).unwrap();
+    assert_eq!(
+        reader.read(0, first.len() + second.len()).await.unwrap(),
+        [first, second].concat()
+    );
     std::fs::remove_dir(cache).unwrap();
 }

@@ -1,7 +1,7 @@
 //! Building blocks for EEDFS.
 
 pub mod format;
-pub mod s3;
+pub mod storage;
 
 pub mod crypto;
 pub mod volume;

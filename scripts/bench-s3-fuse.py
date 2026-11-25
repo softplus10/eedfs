@@ -47,10 +47,10 @@ def write_file(path,total,block=1024*1024):
             while view:
                 n=os.write(fd,view);assert n>0;view=view[n:]
             h.update(data)
-        staging_done=time.perf_counter();os.fsync(fd);sync_done=time.perf_counter()
+        write_done=time.perf_counter();os.fsync(fd);sync_done=time.perf_counter()
     finally:os.close(fd)
     elapsed=time.perf_counter()-start_time
-    return {'bytes':total,'seconds':elapsed,'mib_s':total/1048576/elapsed,'stage_seconds':staging_done-start_time,'fsync_seconds':sync_done-staging_done,'sha256':h.hexdigest()}
+    return {'bytes':total,'seconds':elapsed,'mib_s':total/1048576/elapsed,'write_seconds':write_done-start_time,'fsync_seconds':sync_done-write_done,'sha256':h.hexdigest()}
 def read_fd(fd,total):
     h=hashlib.sha256();count=0;start_time=time.perf_counter()
     while True:
@@ -82,6 +82,20 @@ try:
     os.pwrite(fd,b'updated',150_000);os.fsync(fd);os.ftruncate(fd,10);os.fsync(fd);os.ftruncate(fd,300_000);os.fsync(fd)
     assert os.pread(fd,300_000,0)==data[:10]+bytes(299_990)
     os.pwrite(fd,b'tail',400_000);os.fsync(fd);assert os.pread(fd,14,399_990)==bytes(10)+b'tail';os.close(fd)
+    # A partial fsync seals a chunk; subsequent append and close add new chunks.
+    append_path=mounts[0]/'mid-sync'
+    fd=os.open(append_path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o644)
+    expected=b''
+    for size,value in [(3*1048576,11),(2*1048576,12)]:
+        data=bytes([value])*size;view=memoryview(data)
+        while view:
+            n=os.write(fd,view);assert n>0;view=view[n:]
+        assert (mounts[1]/'mid-sync').read_bytes()==expected
+        os.fsync(fd);expected+=data
+        assert (mounts[1]/'mid-sync').read_bytes()==expected
+    assert os.write(fd,b'close-commits')==13
+    os.close(fd)  # deliberately no final fsync; check successful close publication
+    assert (mounts[2]/'mid-sync').read_bytes()==expected+b'close-commits'
     # Open snapshots: stale writer must report EAGAIN and leave the winner intact.
     f0=os.open(mounts[0]/'check',os.O_RDWR);f1=os.open(mounts[1]/'check',os.O_RDWR)
     os.pwrite(f0,b'winner',0);os.pwrite(f1,b'loser!',0);os.fsync(f0)
@@ -95,7 +109,7 @@ try:
     (mounts[0]/'check').unlink();assert not (mounts[1]/'check').exists()
     stop(0);mounts[0]=start(0)
     assert (mounts[0]/'nested'/'small').read_bytes()==b'hello'
-    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount']})
+    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','close-commit']})
     if a.benchmark:
         # Same-directory metadata contention, with each writer on a different mount.
         def small_files(i):

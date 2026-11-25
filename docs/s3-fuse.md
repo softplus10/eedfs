@@ -52,7 +52,7 @@ one trailing LF and optional preceding CR removed; empty passwords are rejected.
 Writer policy: `--chunk-size` defaults to 8 MiB, accepted range 64 KiB–64 MiB.
 It is not persisted as a per-file maximum. Existing variable-size chunks remain
 readable with a different writer policy. `--parallelism` defaults to 8 (1–32),
-bounding each commit's in-flight uploads/downloads. `--threads` defaults to 8
+bounding each file upload queue and download batch. `--threads` defaults to 8
 FUSE workers (1–64). The shared SDK client pools HTTP connections. Uploads use
 shared byte buffers rather than cloning entire ciphertext payloads for retries.
 
@@ -75,13 +75,17 @@ shared byte buffers rather than cloning entire ciphertext payloads for retries.
 
 ## Commit and conflict behavior
 
-`write()` acknowledges local staging. Successful `fsync()` or `flush()` waits for
-new chunks (`If-None-Match:*`) and then publishes the inode with its original
-ETag (`If-Match`). Only changed writer-sized regions are rewritten when old
-chunks align; unmodified chunks are reused. Partial overwrites of a large chunk
-therefore incur read/modify/write amplification. A new allocation ID is generated
-for each commit's new chunk run. The chunk size is a policy tradeoff, not free
-small-write performance.
+`write()` acknowledges local buffering and queues complete append chunks for
+background encryption/upload. `fsync()` seals the remaining short tail, waits for
+uploads (`If-None-Match:*`) and publishes the inode using its original ETag
+(`If-Match`). A committed partial tail is preserved on later append. Existing
+regions are rewritten with COW when overwritten. The per-file mutex defines the
+fsync generation boundary; later writes to that file wait for the barrier.
+Background failures are retained for fsync/flush. Close attempts the same barrier.
+
+See the [writeback contract](writeback.md) for precise acceptance, publication,
+backpressure, error and close semantics. Chunk sizing is a writer policy, not free
+small-write performance. Unreferenced uploads still require future GC.
 
 A stale same-file writer gets `EAGAIN`; no automatic merge of same-file data is
 claimed. Its staged local changes remain until the handle is closed. The caller
