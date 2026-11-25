@@ -141,7 +141,9 @@ format and cryptographic implementation groups.
 
 The [writeback contract](docs/writeback.md) defines background upload during writes,
 partial fsync and append, error delivery and close-time commit. No stored format
-change is required. Public S3 transport types now live under `eedfs::storage::s3`.
+change is required. Public S3 transport types now live under `eedfs::storage::s3`. The
+[streaming writeback validation](docs/benchmarks/writeback-2026-11-25.md) records
+mid-stream fsync/close checks, fault injection and a mounted 10 GiB run.
 
 ## Local crypto benchmark
 
