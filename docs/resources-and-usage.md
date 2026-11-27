@@ -9,7 +9,7 @@ Different mounts have independent budgets; these options are not a volume quota.
 | `--memory-mib` | 512 | Managed data buffers and estimated inode/index working metadata |
 | `--spool-mib` | 4096 | Resident anonymous spool ranges across all files |
 | `--s3-requests` | 64 | Total concurrent S3 operations across the shared client |
-| `--max-cached-inodes` | 65536 | FUSE inode registry, including referenced and open inodes |
+| `--max-cached-inodes` | 65536 | FUSE inode registry and tracked writeback sessions |
 
 `--parallelism` still bounds each file pipeline. The shared S3 request budget
 reserves up to four slots for metadata/control operations, separately from data
@@ -19,8 +19,9 @@ PUT error readback releases its original request permit before acquiring another
 Managed memory reservations are acquired before data download/encryption and
 metadata hydration. Persistent metadata uses conservative estimates; one quarter
 of the budget is reserved from ordinary allocations for transient I/O/commit
-work. Reservation failure returns ENOMEM rather than waiting while holding an
-inode mutex and preventing the barrier that would release resources. This is not
+work. Reservations never wait while holding an inode mutex. When queued close
+writeback can free resources, the adapter drops that mutex and waits for progress
+before retrying a rejected write. Otherwise reservation failure returns ENOMEM. This is not
 an exact process-RSS limit: allocator overhead, SDK buffers, kernel mmap/page
 cache and application memory are outside it. OS/container memory limits remain
 separate. Password unlocking uses the separate bounded Argon2 policy before
@@ -28,8 +29,9 @@ these runtime budgets apply. A maximum-sized chunk needs enough memory for its t
 
 Spool ranges are charged in 4 KiB units, merging overlaps. Logical sparse size is
 not charged as resident bytes. Reserve space before accepting new data; exhaustion
-returns ENOSPC without discarding previously accepted bytes. Truncate/last close
-release charges. Successful large-file commits punch out clean committed spool
+returns ENOSPC when no queued work can free space, without discarding previously
+accepted bytes. Truncate and disposal of completed closed sessions release charges;
+close itself retains dirty charges until background publication succeeds. Successful large-file commits punch out clean committed spool
 ranges; clean read caches can also be evicted when another operation needs space.
 A spool filesystem supporting Linux hole punching is needed for this eviction;
 failed punching keeps the charge, conservatively. Dirty and unpublished data are
@@ -42,7 +44,9 @@ handles pin their inode registry entries. Zero-reference directory listing entri
 can be evicted at the registry limit. Stable inode numbers derive from object
 identity; observed hash collisions fail rather than aliasing two identities.
 A full registry of still-referenced entries returns ENOMEM. The limit includes the
-root and must be at least two.
+root and must be at least two. The same limit bounds tracked writeback sessions,
+whose queue bookkeeping is charged at 1 KiB each. Closed pending/failed sessions
+retain their spools, metadata and keys; failures are not evicted to make room.
 
 Directory handles keep a bounded cursor instead of materializing every entry.
 Tree-backed readdir retrieves lexicographic batches of at most 128 entries.

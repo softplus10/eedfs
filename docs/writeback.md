@@ -24,7 +24,7 @@ The spool retains accepted uncommitted bytes locally. Managed
 [resource budgets](resources-and-usage.md) bound resident spool ranges and buffers.
 Clean committed ranges can be evicted; unpublished dirty data is preserved. There
 is no encrypted local cache or crash recovery of uncommitted writes. Reads and local spool writes may fail directly. A failure
-discovered after bytes were buffered is latched for the next fsync/flush, even
+discovered after bytes were buffered is latched for fsync and already-known close errors, even
 when the corresponding write returned its accepted byte count.
 
 `O_SYNC`/`O_DSYNC` writes invoke the commit barrier before returning, preserving
@@ -39,8 +39,8 @@ A competing local write waits and enters the next generation after the barrier
 completes. Independent opens and hard-link aliases share data, size, attributes
 and spool; FD offsets/flags remain kernel-managed. Different inodes progress
 independently. Different mounts retain independent working states and synchronize
-through inode CAS/merge. A flush/fsync through any local handle commits the shared
-inode's pending generation, including data accepted through another handle.
+through inode CAS/merge. An fsync through any local handle commits the shared inode's pending generation,
+including data accepted through another handle. Close only schedules that work.
 This implementation does not accept concurrent later writes into another buffer
 while that inode's fsync is waiting.
 
@@ -117,7 +117,9 @@ configured managed-memory budget. No minimum stored chunk size was introduced.
 
 ## Errors and retry
 
-Background encryption/PUT errors are retained until fsync/flush reports failure.
+Background encryption/PUT and inode commit errors remain latched in the mount-local
+writeback queue. An fsync first reports a previously unobserved background failure;
+a subsequent explicit fsync can retry. Another close does not retry that failure.
 The barrier drains its upload tasks, including obsolete snapshots, and reports
 failure without publishing a new inode. After the error has been observed, an
 explicit retry can upload missing regions from the preserved local spool and
@@ -131,26 +133,69 @@ have an ambiguous server-side outcome. No rollback or successful-notification
 claim is inferred from an error. The existing exact-byte PUT readback resolves
 some ambiguous requests; it is not a crash-recovery protocol.
 
-## Close
+## Close and shutdown
 
-FUSE `flush` attempts the same commit barrier on descriptor close and returns its
-error to the caller. `release` disposes of handles/resources; it does not hide a
-flush failure by silently retrying publication. A mapping can outlive descriptor
-close: new mapped writes arriving after that flush receive a best-effort commit
-at final release only if no writeback/barrier failure remains. Errors there can
-only be logged; explicit msync/fsync is required to acknowledge durability before
-unmapping. Applications must check close
-errors and use explicit fsync when they need a durability confirmation before
-closing. Crash/process termination before successful fsync/flush can lose local
-buffered writes; cleanup of anonymous spool files is automatic.
+FUSE `flush` schedules an inode commit and returns without acquiring its working
+state mutex or waiting for S3. It can report an already-known failure. A successful
+close means the work is queued, not that the inode CAS succeeded. Final `release`
+also schedules writeback to include mapped pages delivered after an earlier
+flush. Neither `close` nor `munmap` is a durability barrier.
+
+The queue takes strong ownership of the session, spool, staged chunks and latched
+errors before the last handle goes away. Reopening the same inode on that mount
+joins this state; closing and reopening does not discard a conflicting generation.
+One commit at a time holds the inode mutex, while different inodes commit in
+parallel, bounded by `--parallelism` and the mount-wide S3 request budget.
+Explicit fsync waits for its queued generation; O_SYNC/O_DSYNC keep the same
+synchronous guarantee. New closes do not silently retry a failed generation.
+
+Queue bookkeeping is reserved before accepting a file session, charged to managed
+memory (1 KiB per tracked inode), and bounded by `--max-cached-inodes`. Existing
+memory and spool budgets bound pending bytes. Resource-rejected writes and queue
+admission can wait for queued work to free space, always outside inode/global
+registry locks. If no queued work can make progress, the existing ENOMEM/ENOSPC
+limits still apply; a single unclosed file larger than the dirty budget still
+needs batched fsync or a larger budget.
+
+Dirty-file timestamp/attribute updates remain with the buffered data and schedule
+writeback, so a copy tool setting mtime does not implicitly fsync all its data.
+Standalone metadata changes on a clean file keep their synchronous publication.
+Namespace creation/link/rename operations still perform their normal ETag CAS.
+
+On normal unmount, the mount process stops admission and drains queued commits.
+A failed generation is reported without retry and makes the mount process exit
+nonzero. FUSE's destroy callback cannot return a storage error to `fusermount -u`;
+the unmount command can finish before the mount process has drained. Wait for the
+mount process and check its exit status. Linux ordinary FUSE mounts also do not
+forward `syncfs(2)` to the filesystem; do not use a successful shell `sync` as a
+substitute for explicit file fsync or waiting for mount-process shutdown. The
+syncfs callback handles connections that do forward that operation.
+
+A crash, forced process termination, or mount shutdown with failed commits can
+lose uncommitted data. There is no local recovery journal. In particular an
+external `mv` may remove its source after close while destination writeback is
+still pending. Use explicit fsync when durable completion is required.
 
 ## Code and validation
+
+The asynchronous-close implementation passed 119 default Rust tests, six real
+MinIO tests, all 13 mmap checks, the mounted namespace/scaling/GC regressions,
+and rustfmt/clippy/release builds. Five queue tests cover blocked commits,
+cross-inode progress, closed-session ownership, retained failures and explicit
+retry, bounded resources, and reclaiming clean bookkeeping.
+`scripts/check-async-close.py` additionally gates real S3 requests beneath actual
+FUSE mounts: close and dirty-file timestamp updates return while PUT is blocked;
+fsync and O_SYNC/O_DSYNC wait; normal shutdown drains; failed shutdown is nonzero.
+The release build also passed a 1 GiB plus 171-small-file close-only workload,
+normal shutdown and complete remount/hash verification on local MinIO. Those
+results include shutdown drain; close timing alone is not a durability measurement.
 
 - `src/handlers/mod.rs`: FUSE trait wiring.
 - `src/handlers/file.rs`: file callbacks, including write/fsync/flush/close.
 - `src/handlers/directory.rs`: directory callbacks.
 - `src/handlers/state.rs`: FUSE inode/handle mapping and per-file session sharing.
 - `src/volume/session.rs`: buffers, immutable snapshots, bounded uploads, barriers.
+- `src/volume/writeback.rs`: bounded cross-inode queue, retained failures and shutdown drain.
 - `src/volume/mod.rs`: encrypted inode/directory loading and CAS publication.
 - `src/storage/s3.rs`: pooled SDK transport and bounded conditional object I/O.
 
@@ -159,7 +204,7 @@ pre-fsync invisibility, a waiting fsync, bounded backpressure, immutable in-flig
 snapshots, truncate/re-extend zeroing, error delivery, retries and unchanged old
 append references. Real MinIO tests also verify 3 MiB fsync followed by 2 MiB
 append without replacing the first reference. Mounted-client checks exercise
-mid-stream fsync visibility and successful close without a final explicit fsync.
+mid-stream fsync visibility and eventual background publication after close.
 
 Retirement tests cover excluded versus retained references, failed publication,
 failed/idempotent deletion, cleanup delayed across a later commit, same-chunk
@@ -180,4 +225,4 @@ opens and hard-link aliases, independent FD flags/offsets and dup offsets,
 O_TRUNC visibility to existing readers, clean-open adoption of remote versions,
 eight concurrent cold opens and eight local appenders. Workers keep handles open
 until all local reads succeed and another mount confirms that uncommitted data
-is still invisible. Closing/flushing then publishes the shared generation.
+is still invisible. A successful explicit fsync publishes the shared generation; close publication is eventual.

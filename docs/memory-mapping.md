@@ -27,9 +27,10 @@ in the same mount produces the kernel's usual `SIGBUS` behavior.
 
 A mapping keeps its FUSE handle and working state alive after its original FD is
 closed. New mapped writes can therefore arrive after that descriptor's close-time
-flush. On the final release, new unattempted mapped writes receive a best-effort
-commit; errors are logged. Release never silently retries a failed writeback or
-commit barrier. `munmap` provides no durability/error acknowledgement: use explicit
+flush. On final release, new mapped writes are queued for background commit,
+with their state retained after the handle disappears. Errors remain latched for
+explicit fsync or mount-process shutdown. Release never silently retries a failed
+writeback or commit barrier. `munmap` provides no durability/error acknowledgement: use explicit
 msync/fsync before unmapping to observe success or failure.
 
 ## Remote changes and conflicts

@@ -162,25 +162,39 @@ impl S3Filesystem {
             } else {
                 (self.handle(fh)?, None)
             };
-            let mut session = s.lock().unwrap();
-            let offset = if !page_writeback && flags.0 & libc::O_APPEND != 0 {
-                session.size
-            } else {
-                offset
-            };
-            let n = match origin {
-                Some(generation) => self
-                    .runtime
-                    .block_on(session.write_cached(offset, data, generation))?,
-                None => self.runtime.block_on(session.write(offset, data))?,
-            };
-            if n > 0 && _req.uid() != Some(0) {
-                session.clear_setid();
+            loop {
+                let mut session = s.lock().unwrap();
+                let position = if !page_writeback && flags.0 & libc::O_APPEND != 0 {
+                    session.size
+                } else {
+                    offset
+                };
+                let result = match origin {
+                    Some(generation) => self
+                        .runtime
+                        .block_on(session.write_cached(position, data, generation)),
+                    None => self.runtime.block_on(session.write(position, data)),
+                };
+                let n = match result {
+                    Err(error @ (Error::NoSpace | Error::NoMemory)) => {
+                        drop(session);
+                        if self.runtime.block_on(self.writeback.wait_for_progress()) {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    other => other?,
+                };
+                if n > 0 && _req.uid() != Some(0) {
+                    session.clear_setid();
+                }
+                if !page_writeback && flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0 {
+                    let id = session.base.body.id;
+                    drop(session);
+                    self.runtime.block_on(self.writeback.sync(id))?;
+                }
+                return Ok::<_, Error>(n);
             }
-            if !page_writeback && flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0 {
-                self.runtime.block_on(session.commit())?;
-            }
-            Ok::<_, Error>(n)
         })();
         match result {
             Ok(n) => reply.written(n as u32),
@@ -195,7 +209,7 @@ impl S3Filesystem {
         _owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.commit(fh) {
+        match self.flush(fh) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(e)),
         }
@@ -292,6 +306,7 @@ impl S3Filesystem {
                 self.session(ino)?
             };
             let mut session = s.lock().unwrap();
+            let was_dirty = session.is_dirty();
             if let Some(size) = size {
                 self.runtime.block_on(session.prepare())?;
                 session.resize(size)?;
@@ -300,18 +315,28 @@ impl S3Filesystem {
                 }
             }
             session.update_metadata(&update, actor)?;
-            if fh.is_none() || !update.is_empty() {
-                self.runtime.block_on(session.commit())?;
-                self.snapshots.published(&session.base);
-            }
-            self.attr(
+            let barrier = fh.is_none() || !update.is_empty();
+            let attr = self.attr(
                 ino,
                 inode::FILE,
                 session.size,
                 &session.metadata,
                 session.base.body.nlink,
                 session.allocated_size(),
-            )
+            )?;
+            drop(session);
+            if barrier {
+                if was_dirty {
+                    // Copy tools commonly set timestamps before close. Keep
+                    // those changes with the pending data without forcing fsync.
+                    self.writeback.submit(node.id, &s)?;
+                } else {
+                    self.runtime.block_on(self.writeback.sync(node.id))?;
+                }
+            }
+            drop(s);
+            self.writeback.forget_closed(node.id);
+            Ok(attr)
         })();
         match result {
             Ok(a) => reply.attr(&TTL, &a),

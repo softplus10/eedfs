@@ -79,6 +79,7 @@ mod namespace;
 pub use lease::Lease;
 mod session;
 pub mod snapshots;
+pub mod writeback;
 pub use metadata::MetadataUpdate;
 pub use session::FileSession;
 

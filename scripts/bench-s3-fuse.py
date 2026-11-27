@@ -23,7 +23,7 @@ binary=str(pathlib.Path(a.binary).resolve());password=str(pathlib.Path(a.passwor
 prefix='fuse-bench-'+uuid.uuid4().hex+'/'
 common=['--password-file',password,'--prefix',prefix,'--chunk-size',str(a.chunk_size),'--parallelism',str(a.parallelism)]
 subprocess.run([binary,'format',*common],check=True)
-processes={};logs=[];results=[]
+processes={};logs=[];results=[];expected_shutdown_errors=set()
 def start(i):
     mount=root/f'mount-{i}';cache=root/f'cache-{i}';mount.mkdir(exist_ok=True);cache.mkdir(exist_ok=True)
     log=open(root/f'client-{i}.log','ab');logs.append(log)
@@ -38,8 +38,20 @@ def start(i):
 def stop(i):
     proc=processes.pop(i);mount=root/f'mount-{i}'
     subprocess.run(['fusermount3','-u',str(mount)],check=True)
-    proc.wait(timeout=30)
-    if proc.returncode:raise RuntimeError(f'client {i} exited with {proc.returncode}')
+    proc.wait(timeout=300)
+    if i in expected_shutdown_errors:
+        expected_shutdown_errors.remove(i)
+        assert proc.returncode!=0, 'failed writeback was hidden at shutdown'
+        assert 'mount shutdown has uncommitted data' in (root/f'client-{i}.log').read_text()
+    elif proc.returncode:raise RuntimeError(f'client {i} exited with {proc.returncode}')
+def fsync_path(path):
+    fd=os.open(path,os.O_RDWR)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+def write_committed(path,data):
+    with open(path,'wb') as f:
+        n=f.write(data);f.flush();os.fsync(f.fileno())
+    return n
 def write_file(path,total,block=1024*1024):
     payload=os.urandom(block);h=hashlib.sha256();start_time=time.perf_counter()
     fd=os.open(path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o644)
@@ -75,13 +87,14 @@ def record(name,result):
 try:
     mounts=[start(i) for i in range(3)]
     subprocess.run([sys.executable,str(pathlib.Path(__file__).with_name('check-mmap.py')),*map(str,mounts)],check=True)
+    expected_shutdown_errors.add(0)  # intentionally rejected stale mapped pages
     # Cross-client visibility, nested directories, overwrite, truncate and sparse gaps.
     (mounts[0]/'nested').mkdir()
     with open(mounts[0]/'nested'/'small','wb') as f:f.write(b'hello');f.flush();os.fsync(f.fileno())
     assert (mounts[1]/'nested'/'small').read_bytes()==b'hello'
     # One inode working state per mount: separate opens and hard-link aliases
     # see local writes/resize before fsync, with independent kernel FD flags.
-    (mounts[1]/'shared-local').write_bytes(b'abcdef')
+    write_committed(mounts[1]/'shared-local',b'abcdef')
     shared=mounts[0]/'shared-local';local_fds=[]
     try:
         writer=os.open(shared,os.O_RDWR);local_fds.append(writer)
@@ -130,7 +143,7 @@ try:
     reader=os.open(shared,os.O_RDONLY)
     try:
         assert os.pread(reader,3,0)==b'new'
-        (mounts[1]/'shared-local').write_bytes(b'remote')
+        write_committed(mounts[1]/'shared-local',b'remote')
         joined=os.open(shared,os.O_RDONLY)
         try:
             assert os.pread(joined,6,0)==os.pread(reader,6,0)==b'remote'
@@ -140,7 +153,7 @@ try:
     # No worker closes/flushes until all local reads and the remote check finish.
     for append in [False,True]:
         name='local-append' if append else 'local-concurrent'
-        (mounts[1]/name).write_bytes(b'')
+        write_committed(mounts[1]/name,b'')
         barrier=threading.Barrier(9,timeout=60)
         records=[bytes([i+1])*32 for i in range(8)]
         def local_worker(i):
@@ -161,6 +174,7 @@ try:
             assert (mounts[2]/name).read_bytes()==b''
             barrier.wait()
             for job in jobs:job.result()
+        fsync_path(mounts[0]/name)
         observed=(mounts[2]/name).read_bytes()
         if append:assert len(observed)==256 and sorted(observed[n:n+32] for n in range(0,256,32))==records
         else:assert observed==b''.join(records)
@@ -182,8 +196,11 @@ try:
         os.fsync(fd);expected+=data
         assert (mounts[1]/'mid-sync').read_bytes()==expected
     assert os.write(fd,b'close-commits')==13
-    os.close(fd)  # deliberately no final fsync; check successful close publication
-    assert (mounts[2]/'mid-sync').read_bytes()==expected+b'close-commits'
+    os.close(fd)  # no final fsync: publication is now eventual
+    deadline=time.monotonic()+30
+    while (mounts[2]/'mid-sync').read_bytes()!=expected+b'close-commits':
+        assert time.monotonic()<deadline, 'background close did not publish'
+        time.sleep(.05)
     # Numeric metadata survives reopening from a different mount.
     os.chmod(mounts[0]/'check',0o640)
     os.utime(mounts[0]/'check',ns=(1_234_000_000_000,5_678_000_000_000))
@@ -217,8 +234,10 @@ try:
     with open(mounts[0]/'check','rb') as f:assert f.read(6)==b'newver'
     os.close(snapshot)
     # Two appenders: the first successful CAS wins even if it wrote later.
-    a0=os.open(mounts[0]/'check',os.O_WRONLY|os.O_APPEND);a1=os.open(mounts[1]/'check',os.O_WRONLY|os.O_APPEND)
-    before=(mounts[2]/'check').stat().st_size
+    write_committed(mounts[2]/'append-conflict',b'baseline')
+    expected_shutdown_errors.add(0)
+    a0=os.open(mounts[0]/'append-conflict',os.O_WRONLY|os.O_APPEND);a1=os.open(mounts[1]/'append-conflict',os.O_WRONLY|os.O_APPEND)
+    before=(mounts[2]/'append-conflict').stat().st_size
     os.write(a0,b'loser');os.write(a1,b'winner');os.fsync(a1)
     try:os.fsync(a0)
     except OSError as e:assert e.errno==errno.EAGAIN,e
@@ -226,14 +245,14 @@ try:
     os.close(a1)
     try:os.close(a0)
     except OSError as e:assert e.errno==errno.EAGAIN,e
-    with open(mounts[2]/'check','rb') as f:f.seek(before);assert f.read()==b'winner'
+    with open(mounts[2]/'append-conflict','rb') as f:f.seek(before);assert f.read()==b'winner'
     if os.geteuid()==0:
         permissions=mounts[0]/'permissions';permissions.mkdir();os.chmod(permissions,0o777)
         def as_user(uid,gid,code,path):
             command='import os,sys;os.setgroups([]);os.setgid(int(sys.argv[1]));os.setuid(int(sys.argv[2]));'+code
             subprocess.run([sys.executable,'-c',command,str(gid),str(uid),str(path)],check=True)
         owned=permissions/'owned'
-        as_user(1234,2000,'fd=os.open(sys.argv[3],os.O_CREAT|os.O_WRONLY,0o640);os.write(fd,b"secret");os.close(fd)',owned)
+        as_user(1234,2000,'fd=os.open(sys.argv[3],os.O_CREAT|os.O_WRONLY,0o640);os.write(fd,b"secret");os.fsync(fd);os.close(fd)',owned)
         st=(mounts[1]/'permissions'/'owned').stat();assert (st.st_uid,st.st_gid,stat.S_IMODE(st.st_mode))==(1234,2000,0o640)
         as_user(1235,2000,'assert open(sys.argv[3],"rb").read()==b"secret"',mounts[1]/'permissions'/'owned')
         as_user(1235,2001,'\ntry:open(sys.argv[3],"rb");raise AssertionError("DAC allowed other user")\nexcept PermissionError:pass',mounts[2]/'permissions'/'owned')
@@ -242,6 +261,7 @@ try:
         assert (mounts[1]/'permissions'/'owned').stat().st_gid==3000
         os.chown(owned,2345,3000);st=(mounts[2]/'permissions'/'owned').stat();assert (st.st_uid,st.st_gid)==(2345,3000)
     # Open snapshots: stale writer must report EAGAIN and leave the winner intact.
+    expected_shutdown_errors.add(1)
     f0=os.open(mounts[0]/'check',os.O_RDWR);f1=os.open(mounts[1]/'check',os.O_RDWR)
     os.pwrite(f0,b'winner',0);os.pwrite(f1,b'loser!',0);os.fsync(f0)
     try:os.fsync(f1)
@@ -256,8 +276,8 @@ try:
     assert (mounts[0]/'nested'/'small').read_bytes()==b'hello'
     # Namespace callbacks: replacement keeps old open snapshots alive.
     (mounts[0]/'ns-left').mkdir();(mounts[0]/'ns-right').mkdir()
-    source=mounts[0]/'ns-left'/'source';source.write_bytes(b'new-content')
-    destination=mounts[1]/'ns-right'/'destination';destination.write_bytes(b'old-content')
+    source=mounts[0]/'ns-left'/'source';write_committed(source,b'new-content')
+    destination=mounts[1]/'ns-right'/'destination';write_committed(destination,b'old-content')
     old_fd=os.open(destination,os.O_RDONLY)
     os.replace(source,mounts[0]/'ns-right'/'destination')
     assert os.pread(old_fd,11,0)==b'old-content';os.close(old_fd)
@@ -271,7 +291,7 @@ try:
     os.pwrite(survivor,b'updated',0);os.fsync(survivor)
     assert os.pread(survivor,7,0)==b'updated';os.close(survivor)
     assert not (mounts[2]/'ns-left'/'alias').exists()
-    (mounts[0]/'ns-right'/'target').write_bytes(b'target')
+    write_committed(mounts[0]/'ns-right'/'target',b'target')
     os.symlink('../ns-right/target',mounts[0]/'ns-left'/'relative')
     assert os.readlink(mounts[1]/'ns-left'/'relative')=='../ns-right/target'
     assert (mounts[2]/'ns-left'/'relative').read_bytes()==b'target'
@@ -298,7 +318,7 @@ try:
     with open(mounts[2]/'large-hole','rb') as f:f.seek((1<<33)-2);assert f.read(10)==bytes(2)+b'middle'+bytes(2)
     assert (mounts[1]/'large-hole').stat().st_blocks<=8
     # Repeat independent same-file writes from all three clients.
-    merge=mounts[0]/'merge-three';merge.write_bytes(bytes(4096))
+    merge=mounts[0]/'merge-three';write_committed(merge,bytes(4096))
     for iteration in range(12):
         fds=[os.open(m/'merge-three',os.O_RDWR) for m in mounts]
         for i,fd in enumerate(fds):os.pwrite(fd,bytes([iteration+1+i])*16,i*64)
@@ -311,7 +331,7 @@ try:
     def namespace_worker(i):
         for n in range(12):
             name=f'entry-{i}-{n}';left=mounts[i]/'race-a'/name;right=mounts[i]/'race-b'/name
-            left.write_bytes(bytes([i])*32);os.rename(left,right)
+            write_committed(left,bytes([i])*32);os.rename(left,right)
             os.link(right,left);right.unlink();left.unlink()
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:list(pool.map(namespace_worker,range(3)))
     assert list((mounts[2]/'race-a').iterdir())==[] and list((mounts[2]/'race-b').iterdir())==[]
@@ -320,7 +340,7 @@ try:
     (mounts[0]/'indexed').mkdir()
     def indexed_create(i):
         path=mounts[i%3]/'indexed'/f'entry-{i:04}'
-        path.write_bytes(str(i).encode())
+        write_committed(path,str(i).encode())
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:list(pool.map(indexed_create,range(1200)))
     assert len(list((mounts[2]/'indexed').iterdir()))==1200
     for i in [0,63,64,1023,1024,1199]:assert (mounts[1]/'indexed'/f'entry-{i:04}').read_bytes()==str(i).encode()
@@ -344,7 +364,7 @@ try:
     common[common.index('--password-file')+1]=str(changed_password)
     mounts[2]=start(2)
     assert (mounts[2]/'indexed'/'renamed').read_bytes()==b'0'
-    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','close-commit','disjoint-merge','append-first-CAS','snapshot-polling','retired-chunk-refresh','numeric-metadata-permissions','rename-replace','hard-link','open-unlink-write','symlink','rmdir','directory-move-cycle','objectless-16GiB-hole','three-client-merge-12-rounds','namespace-contention-36-rounds','indexed-directory-1200','password-change-and-remount','shared-local-inode','shared-local-truncate','shared-local-fd-flags-and-offsets','clean-open-refresh','concurrent-local-opens','local-atomic-append','mmap-shared-msync-13-checks']})
+    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','background-close-commit','disjoint-merge','append-first-CAS','snapshot-polling','retired-chunk-refresh','numeric-metadata-permissions','rename-replace','hard-link','open-unlink-write','symlink','rmdir','directory-move-cycle','objectless-16GiB-hole','three-client-merge-12-rounds','namespace-contention-36-rounds','indexed-directory-1200','password-change-and-remount','shared-local-inode','shared-local-truncate','shared-local-fd-flags-and-offsets','clean-open-refresh','concurrent-local-opens','local-atomic-append','mmap-shared-msync-13-checks']})
     if a.benchmark:
         # Same-directory metadata contention, with each writer on a different mount.
         def small_files(i):

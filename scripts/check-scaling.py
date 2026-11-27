@@ -99,5 +99,5 @@ try:
     print('mounted scaling checks passed',flush=True)
 finally:
     if os.path.ismount(mount):subprocess.run(['fusermount3','-u',str(mount)],check=True)
-    proc.wait(timeout=30)
+    proc.wait(timeout=300)
     log.close()

@@ -2,6 +2,7 @@
 mod directory_and_password;
 mod garbage_collection;
 mod scaling;
+mod writeback;
 use super::*;
 use crate::{
     crypto::{SecretKey, encryption},
@@ -28,6 +29,8 @@ struct State {
     objects: Mutex<HashMap<String, (Vec<u8>, String)>>,
     inode: Mutex<String>,
     block: Mutex<bool>,
+    block_inode: Mutex<bool>,
+    inode_started: AtomicUsize,
     gate: Condvar,
     deny_chunks: AtomicBool,
     deny_inode: AtomicBool,
@@ -65,6 +68,8 @@ impl Server {
             objects: Mutex::new(HashMap::new()),
             inode: Mutex::new(String::new()),
             block: Mutex::new(false),
+            block_inode: Mutex::new(false),
+            inode_started: AtomicUsize::new(0),
             gate: Condvar::new(),
             deny_chunks: AtomicBool::new(false),
             deny_inode: AtomicBool::new(false),
@@ -120,6 +125,7 @@ impl Server {
     }
     fn release(&self) {
         *self.state.block.lock().unwrap() = false;
+        *self.state.block_inode.lock().unwrap() = false;
         *self.state.block_delete.lock().unwrap() = false;
         self.state.gate.notify_all();
     }
@@ -271,6 +277,13 @@ fn serve(mut stream: TcpStream, s: &State) -> std::io::Result<()> {
             }
         }
         "PUT" => {
+            if is_inode {
+                s.inode_started.fetch_add(1, Ordering::SeqCst);
+                let mut gate = s.block_inode.lock().unwrap();
+                while *gate && !s.stop.load(Ordering::SeqCst) {
+                    gate = s.gate.wait(gate).unwrap();
+                }
+            }
             if !is_inode {
                 s.started.fetch_add(1, Ordering::SeqCst);
                 let mut gate = s.block.lock().unwrap();

@@ -53,7 +53,7 @@ def start():
 def stop():
     global proc
     subprocess.run(['fusermount3', '-u', str(mount)], check=True)
-    assert proc.wait(timeout=30) == 0
+    assert proc.wait(timeout=300) == 0
     proc = None
 
 def digest(path):
@@ -68,7 +68,8 @@ try:
     block = os.urandom(1024*1024)
     expected = hashlib.sha256()
     begin = time.monotonic()
-    # Deliberately omit fsync: exercise the desktop copy's close barrier.
+    copy_begin = begin
+    # Deliberately omit fsync: close queues work, normal unmount drains it.
     with open(mount/'large.bin', 'wb', buffering=0) as f:
         for i in range(a.large_mib):
             view = memoryview(block)
@@ -80,7 +81,7 @@ try:
             if (i+1) % 256 == 0:
                 print('large MiB written:', i+1, flush=True)
     report['large_close_seconds'] = time.monotonic()-begin
-    print('Large close barrier passed:', report['large_close_seconds'], 'seconds', flush=True)
+    print('Large write and close accepted:', report['large_close_seconds'], 'seconds', flush=True)
     assert (mount/'large.bin').stat().st_size == a.large_mib*1048576
     (mount/'small').mkdir()
     begin = time.monotonic()
@@ -92,10 +93,13 @@ try:
             f.write(data)
         small[name] = (len(data), hashlib.sha256(data).hexdigest())
         if (i+1) % 50 == 0:
-            print('Small files committed:', i+1, flush=True)
+            print('Small files queued:', i+1, flush=True)
     report['small_copy_seconds'] = time.monotonic()-begin
-    print('All small files committed:', a.small_files, flush=True)
+    print('All small file closes accepted:', a.small_files, flush=True)
+    drain_begin = time.monotonic()
     stop()
+    report['shutdown_drain_seconds'] = time.monotonic()-drain_begin
+    report['copy_and_drain_seconds'] = time.monotonic()-copy_begin
     start()
     begin = time.monotonic()
     with os.scandir(mount/'small') as entries:
@@ -116,5 +120,5 @@ finally:
             stop()
         else:
             proc.terminate()
-            proc.wait(timeout=30)
+            proc.wait(timeout=300)
     log.close()

@@ -95,20 +95,20 @@ python3 scripts/check-transfers.py --binary target/release/eedfs \
   --password-file /private/password --work-dir /tmp/eedfs-transfer-check
 ```
 
-This creates a unique volume, writes a 1 GiB file using close as its commit
-barrier, creates 171 mixed small files, remounts, times a cold listing with
+This creates a unique volume, writes a 1 GiB file without an explicit fsync,
+creates 171 mixed small files, drains the mount process on unmount, remounts, and times a cold listing with
 attributes, and verifies all file hashes. It leaves its isolated volume prefix
 in the test bucket; it does not operate on an existing mounted volume. Local
 MinIO timings do not predict provider latency or prove an R2 timeout is resolved.
 
-The release build passed this close-only 1 GiB/171-file regression with full
+Before asynchronous close was introduced, the release build passed this close-only 1 GiB/171-file regression with full
 remount/hash verification on local MinIO. A separate counting HTTP proxy test
 with 40 files reduced cold enumeration-plus-stat GETs from 298 with zero TTL
 to 51 with the directory/READDIRPLUS one-second TTL. These request counts are
 local proxy results, not R2 request counts.
 
-A separate isolated R2 volume also passed the 1 GiB/171-file close, remount and
-complete hash verification using the release build. The observed timings were
+That synchronous-close release build also passed a separate isolated R2
+1 GiB/171-file copy, remount and complete hash verification. The observed timings were
 124.6 seconds for the large-file write including close, 379.1 seconds for the
 171 mixed small-file writes including close, and 16.6 seconds for cold
 enumeration with attributes. This was one run, without a pre-change R2 baseline;
@@ -123,7 +123,7 @@ S3 request and inode-registry limits.
 - Nested directories with encrypted inline entries or immutable B+tree pages.
 - Create/open, read/write, partial overwrite, truncate, sparse zero-filled gaps,
   unlink (including open files), rename/replacement, rmdir, hard links, symlinks,
-  directory listing, fsync/flush and remount persistence.
+  directory listing, explicit fsync, asynchronous close and remount persistence.
 - Small files inline in inodes, larger files stored as independently encrypted
   immutable chunks. Separate derived keys for inode bodies and chunk data.
 - Read/private/shared memory mappings and msync; see the
@@ -139,8 +139,9 @@ S3 request and inode-registry limits.
   Attribute/entry TTL is zero except for one-second READDIRPLUS and directory
   lookup/getattr replies.
 - Local staging uses anonymous mode-0600 files outside the mount; plaintext spool
-  contents consume local disk while handles are open. File names are immediately
-  unlinked, so releasing the last handle/mapping or process exit releases the spool. Local
+  contents consume local disk while handles or pending writeback retain them. File names are
+  immediately unlinked; completed closed sessions release the spool. Process exit
+  releases remaining local spool files. Local
   OS page cache may retain plaintext in memory; this is not a remote encrypted cache.
 - Uploads are bounded and concurrent; downloads prefetch up to four adjacent old
   chunks for a read range. CPU encryption runs in Tokio blocking workers.
@@ -153,7 +154,10 @@ uploads (`If-None-Match:*`) and publishes the inode using its original ETag
 (`If-Match`). A committed partial tail is preserved on later append. Existing
 regions are rewritten with COW when overwritten. The per-file mutex defines the
 fsync generation boundary; later writes to that file wait for the barrier.
-Background failures are retained for fsync/flush. Close attempts the same barrier.
+Close queues background publication and returns without waiting for S3. The queue
+retains closed dirty sessions and failures. Explicit fsync waits for publication;
+normal unmount drains queued work and reports failures in the mount-process exit
+status. See the writeback contract for the Linux FUSE unmount/syncfs limitations.
 
 See the [writeback contract](writeback.md) for precise acceptance, publication,
 backpressure, error and close semantics. Chunk sizing is a writer policy, not free
@@ -162,11 +166,10 @@ small-write performance. Unreferenced uploads can be reclaimed by the
 
 Stale cross-client writers merge disjoint byte ranges, including within one chunk.
 Overlapping writes (including equal-byte writes) and competing append size changes
-return `EAGAIN`. Staged changes remain while that mount's inode working state is
-open. To discard an unmergeable generation, close all local handles to that inode,
-then reopen and reapply against a fresh version. Close-time flush
-errors must be checked, and applications should use explicit fsync to observe
-conflicts. No application file lock or cross-client atomic append is provided.
+return `EAGAIN`. Staged changes and failures remain in the mount even after the
+last handle closes; reopening joins them. An unmergeable generation is not discarded
+or relocated automatically. Applications should use explicit fsync to observe
+conflicts. Already-known errors can also be reported by close. No application file lock or cross-client atomic append is provided.
 
 Directory insert/remove operations reload the latest parent and retry ETag CAS
 up to 16 times, preserving independent entry edits. New inode objects are staged

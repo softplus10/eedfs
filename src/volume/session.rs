@@ -312,6 +312,16 @@ impl FileSession {
     pub fn needs_release_commit(&self) -> bool {
         self.changed && self.cached_pending && !self.failed_barrier
     }
+    /// Automatic close writeback must not silently retry an already failed
+    /// barrier or a rejected mapped-page generation. An explicit fsync can retry.
+    pub async fn commit_background(&mut self) -> Result<()> {
+        if self.failed_barrier {
+            return Err(Error::Other(
+                "previous writeback failed; explicit fsync is required".into(),
+            ));
+        }
+        self.commit().await
+    }
     async fn write_from(
         &mut self,
         offset: u64,

@@ -150,6 +150,11 @@ rejected. Basic POSIX attributes and password changes are included; master-key
 rotation and revocation remain future work. The cryptographic integration has
 not received a security audit.
 
+Future changes must preserve read/write compatibility with current v7 volumes.
+Routine upgrades must keep them usable by existing clients; incompatible format
+changes require explicit opt-in migration. See the [format compatibility
+policy](docs/file-index.md).
+
 ## Password changes
 
 With the S3 connection environment already configured:
@@ -180,7 +185,7 @@ adapter state. `src/volume/` owns file buffers, write generations and inode comm
 format and cryptographic implementation groups.
 
 The [writeback contract](docs/writeback.md) defines background upload during writes,
-partial fsync and append, error delivery and close-time commit. No stored format
+partial fsync and append, retained errors, asynchronous close and shutdown drain. No stored format
 change is required. Public S3 transport types now live under `eedfs::storage::s3`. The
 [streaming writeback validation](docs/benchmarks/writeback-2026-11-25.md) records
 mid-stream fsync/close checks, fault injection and a mounted 10 GiB run.

@@ -8,6 +8,15 @@ use fuser::*;
 pub use state::S3Filesystem;
 use std::{ffi::OsStr, time::SystemTime};
 impl Filesystem for S3Filesystem {
+    fn destroy(&mut self) {
+        self.shutdown();
+    }
+    fn syncfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyEmpty) {
+        match self.runtime.block_on(self.writeback.sync_all()) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(state::errno(error)),
+        }
+    }
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         let _ = config.set_max_write(1024 * 1024);
         // Combine directory enumeration and attribute lookup when the kernel

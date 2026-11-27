@@ -1,7 +1,7 @@
-//! Writable prototype adapter. S3 persistence is acknowledged on fsync/flush.
+//! Writable adapter. Close queues writeback; fsync acknowledges S3 persistence.
 use eedfs::{
     format::{directory::Entry, inode, metadata::Metadata},
-    volume::{Error, FileSession, Loaded, Volume, snapshots::Snapshots},
+    volume::{Error, FileSession, Loaded, Volume, snapshots::Snapshots, writeback::Writeback},
 };
 use fuser::*;
 use std::{
@@ -59,7 +59,9 @@ pub struct S3Filesystem {
     pub(super) state: Mutex<State>,
     pub(super) cache: PathBuf,
     pub(super) snapshots: Arc<Snapshots>,
+    pub(super) writeback: Arc<Writeback>,
     poller: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
 }
 impl S3Filesystem {
     pub fn new(
@@ -76,6 +78,12 @@ impl S3Filesystem {
             opens: 0,
         };
         let snapshots = Arc::new(Snapshots::new(volume.clone()));
+        let writeback = Writeback::new(volume.resources.clone(), snapshots.clone());
+        let writer = runtime.spawn(
+            writeback
+                .clone()
+                .run(runtime.handle().clone(), volume.parallelism),
+        );
         let polling = snapshots.clone();
         let poller = runtime.spawn(async move {
             let mut interval = tokio::time::interval(poll_interval);
@@ -100,7 +108,9 @@ impl S3Filesystem {
             }),
             cache,
             snapshots,
+            writeback,
             poller,
+            writer,
         }
     }
     pub(super) fn creation_metadata(
@@ -140,6 +150,7 @@ impl S3Filesystem {
         if limit < 2 {
             return Err(Error::Invalid);
         }
+        self.writeback.set_limit(limit)?;
         self.state.lock().unwrap().max_nodes = limit;
         Ok(())
     }
@@ -252,31 +263,48 @@ impl S3Filesystem {
             None => self.runtime.block_on(self.snapshots.open(node.id))?,
         };
         let candidate = Arc::new(Mutex::new(self.volume.file(loaded, &self.cache)?));
-        let mut state = self.state.lock().unwrap();
-        if let Some(session) = state
-            .files
-            .get(&node.id)
-            .and_then(|file| file.session.upgrade())
-        {
-            return Ok((session, true));
-        }
-        if state.files.len() >= state.max_nodes {
-            state
+        loop {
+            let mut state = self.state.lock().unwrap();
+            if let Some(session) = state
                 .files
-                .retain(|_, file| file.handles != 0 || file.session.strong_count() != 0);
-            if state.files.len() >= state.max_nodes {
-                return Err(Error::NoMemory);
+                .get(&node.id)
+                .and_then(|file| file.session.upgrade())
+            {
+                return Ok((session, true));
             }
+            if state.files.len() >= state.max_nodes {
+                state
+                    .files
+                    .retain(|_, file| file.handles != 0 || file.session.strong_count() != 0);
+                if state.files.len() >= state.max_nodes {
+                    drop(state);
+                    if self.runtime.block_on(self.writeback.wait_for_progress()) {
+                        continue;
+                    }
+                    return Err(Error::NoMemory);
+                }
+            }
+            let tracked = match self.writeback.track(node.id, &candidate) {
+                Err(Error::NoMemory) => {
+                    drop(state);
+                    if self.runtime.block_on(self.writeback.wait_for_progress()) {
+                        continue;
+                    }
+                    return Err(Error::NoMemory);
+                }
+                other => other?,
+            };
+            let reused = !Arc::ptr_eq(&tracked, &candidate);
+            state.files.insert(
+                node.id,
+                LocalFile {
+                    session: Arc::downgrade(&tracked),
+                    generations: BTreeMap::new(),
+                    handles: 0,
+                },
+            );
+            return Ok((tracked, reused));
         }
-        state.files.insert(
-            node.id,
-            LocalFile {
-                session: Arc::downgrade(&candidate),
-                generations: BTreeMap::new(),
-                handles: 0,
-            },
-        );
-        Ok((candidate, false))
     }
     pub(super) fn handle(&self, fh: FileHandle) -> Result<Session, Error> {
         self.state
@@ -322,14 +350,10 @@ impl S3Filesystem {
         };
         drop(state);
         if last {
-            let mut working = handle.session.lock().unwrap();
-            if working.needs_release_commit() {
-                match self.runtime.block_on(working.commit()) {
-                    Ok(()) => self.snapshots.published(&working.base),
-                    Err(error) => log::error!(
-                        "final mapped writeback commit failed: {error}; use msync/fsync to observe errors before unmapping"
-                    ),
-                }
+            // Mapped writes can arrive after the descriptor's earlier FLUSH.
+            // Retain and enqueue without waiting on an in-flight inode commit.
+            if let Err(error) = self.writeback.submit(handle.id, &handle.session) {
+                log::error!("final release writeback remains pending: {error}");
             }
         }
         self.snapshots.unpin(handle.id);
@@ -343,6 +367,10 @@ impl S3Filesystem {
         {
             state.files.remove(&handle.id);
         }
+        let id = handle.id;
+        drop(state);
+        drop(handle);
+        self.writeback.forget_closed(id);
     }
     pub(super) fn add_handle(
         &self,
@@ -487,11 +515,30 @@ impl S3Filesystem {
         )
     }
     pub(super) fn commit(&self, fh: FileHandle) -> Result<(), Error> {
-        let session = self.handle(fh)?;
-        let mut session = session.lock().unwrap();
-        self.runtime.block_on(session.commit())?;
-        self.snapshots.published(&session.base);
-        Ok(())
+        let (id, _session) = self.writeback_handle(fh)?;
+        self.runtime.block_on(self.writeback.sync(id))
+    }
+    fn writeback_handle(&self, fh: FileHandle) -> Result<([u8; 16], Session), Error> {
+        self.state
+            .lock()
+            .unwrap()
+            .handles
+            .get(&fh.0)
+            .map(|h| (h.id, h.session.clone()))
+            .ok_or(Error::Missing)
+    }
+    pub(super) fn flush(&self, fh: FileHandle) -> Result<(), Error> {
+        let (id, session) = self.writeback_handle(fh)?;
+        self.writeback.submit(id, &session)
+    }
+    pub fn writeback_status(&self) -> Arc<Writeback> {
+        self.writeback.clone()
+    }
+    pub(super) fn shutdown(&self) {
+        self.poller.abort();
+        if let Err(error) = self.runtime.block_on(self.writeback.shutdown()) {
+            log::error!("mount shutdown has uncommitted data: {error}");
+        }
     }
 }
 pub(super) fn errno(error: Error) -> Errno {
@@ -525,7 +572,8 @@ pub(super) fn errno(error: Error) -> Errno {
 
 impl Drop for S3Filesystem {
     fn drop(&mut self) {
-        self.poller.abort();
+        self.shutdown();
+        self.writer.abort();
     }
 }
 

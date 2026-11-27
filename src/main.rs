@@ -323,7 +323,9 @@ fn main() -> Result<(), ConnectionError> {
                 MountOption::NoDev,
                 MountOption::NoSuid,
             ];
+            let writeback = filesystem.writeback_status();
             fuser::mount(filesystem, mountpoint, &config)?;
+            writeback.shutdown_result()?;
             Ok(())
         }
         Command::S3 {

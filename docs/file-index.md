@@ -6,6 +6,15 @@ remain unchanged. Clients reject inode v1–v6; no automatic migration is provid
 Existing experimental volumes need an explicit migration/export using their old
 client, or recreation. Never mix old and new clients on an active volume.
 
+From the current inode v7 baseline onward, preserve backward compatibility:
+new clients must continue reading and writing existing volumes. Routine client
+upgrades must not silently rewrite a volume into a representation its existing
+clients cannot read. Preserve wire tags, cryptographic algorithm IDs, key
+derivation labels and authenticated framing. Any future incompatible extension
+requires an explicit, separately documented opt-in upgrade with client capability
+checks and a migration path; rejecting the previous version is not a routine
+upgrade strategy.
+
 Small files retain the flat representation. Publication promotes a file when it
 exceeds 1,024 chunk references, 512 mutation groups, 2,048 last-writer intervals,
 or the inline inode encoding no longer fits. Indexed files remain indexed even
