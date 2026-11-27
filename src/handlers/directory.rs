@@ -8,6 +8,8 @@ use eedfs::{
 };
 use fuser::*;
 use std::ffi::OsStr;
+// Let a file manager consume attributes delivered by READDIRPLUS. A zero TTL
+// would expire them before its immediately following stat and repeat the GETs.
 impl S3Filesystem {
     pub(super) fn handle_lookup(
         &self,
@@ -19,16 +21,27 @@ impl S3Filesystem {
         let result = (|| {
             let node = self.node(parent)?;
             let name = name.to_str().ok_or(Error::Invalid)?;
-            let entries = self.runtime.block_on(self.volume.list(node.id))?;
-            let entry = entries
-                .iter()
-                .find(|e| e.name == name)
+            let entry = self
+                .runtime
+                .block_on(self.volume.lookup(node.id, name))?
                 .ok_or(Error::Missing)?;
-            let ino = self.register(parent, entry);
-            self.getattr_inner(ino)
+            let ino = self.register(parent, &entry)?;
+            let result = self.getattr_inner(ino);
+            if result.is_err() {
+                self.forget_node(ino, 1);
+            }
+            result
         })();
         match result {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(
+                if attr.kind == FileType::Directory {
+                    &DIRECTORY_TTL
+                } else {
+                    &TTL
+                },
+                &attr,
+                Generation(0),
+            ),
             Err(e) => reply.error(errno(e)),
         }
     }
@@ -45,12 +58,18 @@ impl S3Filesystem {
         let result = (|| {
             let p = self.node(parent)?;
             let name = name.to_str().ok_or(Error::Invalid)?;
-            let loaded = self.runtime.block_on(self.volume.create_with_metadata(
-                p.id,
-                name,
-                inode::DIRECTORY,
-                self.creation_metadata(p.id, owner, mode, umask, inode::DIRECTORY)?,
-            ))?;
+            let loaded = self
+                .runtime
+                .block_on(self.volume.create_inheriting_metadata(
+                    p.id,
+                    name,
+                    inode::DIRECTORY,
+                    eedfs::format::metadata::Metadata::new(
+                        owner.uid,
+                        owner.gid,
+                        (mode & !umask & 0o7777) as u16,
+                    ),
+                ))?;
             let ino = self.register(
                 parent,
                 &Entry {
@@ -58,7 +77,7 @@ impl S3Filesystem {
                     id: loaded.body.id,
                     kind: inode::DIRECTORY,
                 },
-            );
+            )?;
             self.attr(
                 ino,
                 inode::DIRECTORY,
@@ -150,7 +169,7 @@ impl S3Filesystem {
                     id: l.body.id,
                     kind: l.body.kind,
                 },
-            );
+            )?;
             self.getattr_inner(number)
         })();
         match result {
@@ -182,7 +201,7 @@ impl S3Filesystem {
                     id: l.body.id,
                     kind: inode::SYMLINK,
                 },
-            );
+            )?;
             self.getattr_inner(number)
         })();
         match result {
@@ -209,19 +228,26 @@ impl S3Filesystem {
     ) {
         let result = (|| {
             let node = self.node(ino)?;
-            let entries = self.runtime.block_on(self.volume.list(node.id))?;
-            let mut snapshot = vec![
-                (ino, FileType::Directory, ".".into()),
-                (INodeNo(node.parent), FileType::Directory, "..".into()),
-            ];
-            for e in entries {
-                let number = self.register(ino, &e);
-                snapshot.push((number, file_type(e.kind), e.name));
+            let loaded = self.runtime.block_on(self.volume.load(node.id))?;
+            if loaded.body.kind != inode::DIRECTORY {
+                return Err(Error::NotDirectory);
             }
+            let memory = std::sync::Arc::new(self.volume.resources.memory(1280)?);
+            self.pin_node(ino)?;
             let mut s = self.state.lock().unwrap();
             let fh = s.next_handle;
             s.next_handle += 1;
-            s.directories.insert(fh, snapshot);
+            s.directories.insert(
+                fh,
+                DirCursor {
+                    id: node.id,
+                    ino,
+                    parent: INodeNo(node.parent),
+                    offset: 0,
+                    after: None,
+                    _memory: memory,
+                },
+            );
             Ok::<_, Error>(FileHandle(fh))
         })();
         match result {
@@ -235,20 +261,213 @@ impl S3Filesystem {
         _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectory,
     ) {
-        let s = self.state.lock().unwrap();
-        let Some(entries) = s.directories.get(&fh.0) else {
-            reply.error(Errno::EBADF);
-            return;
-        };
-        for (i, (ino, kind, name)) in entries.iter().enumerate() {
-            let cookie = i as u64 + 1;
-            if cookie > offset && reply.add(*ino, cookie, *kind, name) {
-                break;
+        let mut reply = Some(reply);
+        let result = (|| {
+            let mut cursor = self
+                .state
+                .lock()
+                .unwrap()
+                .directories
+                .get(&fh.0)
+                .cloned()
+                .ok_or(Error::Missing)?;
+            if cursor.offset != offset {
+                cursor.offset = 0;
+                cursor.after = None;
             }
+            // Seeking backwards or to an arbitrary cookie replays bounded batches.
+            while cursor.offset < offset {
+                if cursor.offset < 2 {
+                    cursor.offset += 1;
+                    continue;
+                }
+                let batch = self.runtime.block_on(self.volume.directory_after(
+                    cursor.id,
+                    cursor.after.as_deref(),
+                    128,
+                ))?;
+                if batch.is_empty() {
+                    reply.take().unwrap().ok();
+                    return Ok(());
+                }
+                for entry in batch {
+                    if cursor.offset == offset {
+                        break;
+                    }
+                    cursor.after = Some(entry.name);
+                    cursor.offset += 1;
+                }
+            }
+            while cursor.offset < 2 {
+                let (ino, name) = if cursor.offset == 0 {
+                    (cursor.ino, ".")
+                } else {
+                    (cursor.parent, "..")
+                };
+                if reply
+                    .as_mut()
+                    .unwrap()
+                    .add(ino, cursor.offset + 1, FileType::Directory, name)
+                {
+                    self.state.lock().unwrap().directories.insert(fh.0, cursor);
+                    reply.take().unwrap().ok();
+                    return Ok(());
+                }
+                cursor.offset += 1;
+            }
+            let entries = self.runtime.block_on(self.volume.directory_after(
+                cursor.id,
+                cursor.after.as_deref(),
+                128,
+            ))?;
+            for entry in entries {
+                let number = self.register_node(cursor.ino, &entry, false)?;
+                if reply.as_mut().unwrap().add(
+                    number,
+                    cursor.offset + 1,
+                    file_type(entry.kind),
+                    &entry.name,
+                ) {
+                    break;
+                }
+                cursor.offset += 1;
+                cursor.after = Some(entry.name);
+            }
+            self.state.lock().unwrap().directories.insert(fh.0, cursor);
+            reply.take().unwrap().ok();
+            Ok::<_, Error>(())
+        })();
+        if let Err(e) = result {
+            reply.take().unwrap().error(errno(e));
         }
-        reply.ok();
+    }
+    pub(super) fn handle_readdirplus(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectoryPlus,
+    ) {
+        let mut reply = Some(reply);
+        // Register lookup references only for entries actually returned. Keep
+        // unreturned references refundable if a later attribute fails.
+        let mut registered = Vec::new();
+        let result = (|| {
+            let mut cursor = self
+                .state
+                .lock()
+                .unwrap()
+                .directories
+                .get(&fh.0)
+                .cloned()
+                .ok_or(Error::Missing)?;
+            if cursor.offset != offset {
+                cursor.offset = 0;
+                cursor.after = None;
+            }
+            while cursor.offset < offset {
+                if cursor.offset < 2 {
+                    cursor.offset += 1;
+                    continue;
+                }
+                let entries = self.runtime.block_on(self.volume.directory_after(
+                    cursor.id,
+                    cursor.after.as_deref(),
+                    128,
+                ))?;
+                if entries.is_empty() {
+                    reply.take().unwrap().ok();
+                    return Ok(());
+                }
+                for entry in entries {
+                    if cursor.offset == offset {
+                        break;
+                    }
+                    cursor.after = Some(entry.name);
+                    cursor.offset += 1;
+                }
+            }
+            while cursor.offset < 2 {
+                let (ino, name) = if cursor.offset == 0 {
+                    (cursor.ino, ".")
+                } else {
+                    (cursor.parent, "..")
+                };
+                let attr = self.getattr_inner(ino)?;
+                if reply.as_mut().unwrap().add(
+                    ino,
+                    cursor.offset + 1,
+                    name,
+                    &DIRECTORY_TTL,
+                    &attr,
+                    Generation(0),
+                ) {
+                    self.state.lock().unwrap().directories.insert(fh.0, cursor);
+                    reply.take().unwrap().ok();
+                    return Ok(());
+                }
+                cursor.offset += 1;
+            }
+            // Bound both memory and speculative requests, even for tiny FUSE
+            // buffers. Attributes are fetched in parallel, without extra parent
+            // lookups for each child. Normal CAS validation remains unchanged.
+            let entries = self.runtime.block_on(self.volume.directory_after(
+                cursor.id,
+                cursor.after.as_deref(),
+                self.volume.parallelism.min(8),
+            ))?;
+            let loaded = self.runtime.block_on(async {
+                let mut jobs = tokio::task::JoinSet::new();
+                for (i, entry) in entries.iter().enumerate() {
+                    let volume = self.volume.clone();
+                    let id = entry.id;
+                    jobs.spawn(async move { (i, volume.load(id).await) });
+                }
+                let mut loaded = vec![None; entries.len()];
+                while let Some(result) = jobs.join_next().await {
+                    let (i, result) = result?;
+                    match result {
+                        Ok(value) => loaded[i] = Some(value),
+                        Err(Error::Missing) => {} // concurrent unlink
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok::<_, Error>(loaded)
+            })?;
+            for (entry, loaded) in entries.into_iter().zip(loaded) {
+                if let Some(loaded) = loaded {
+                    let ino = self.register(cursor.ino, &entry)?;
+                    registered.push(ino);
+                    let attr = self.loaded_attr(ino, &loaded)?;
+                    if reply.as_mut().unwrap().add(
+                        ino,
+                        cursor.offset + 1,
+                        &entry.name,
+                        &DIRECTORY_TTL,
+                        &attr,
+                        Generation(0),
+                    ) {
+                        self.forget_node(ino, 1);
+                        registered.pop();
+                        break;
+                    }
+                }
+                cursor.offset += 1;
+                cursor.after = Some(entry.name);
+            }
+            self.state.lock().unwrap().directories.insert(fh.0, cursor);
+            reply.take().unwrap().ok();
+            Ok::<_, Error>(())
+        })();
+        if let Err(e) = result {
+            for ino in registered {
+                self.forget_node(ino, 1);
+            }
+            reply.take().unwrap().error(errno(e));
+        }
     }
     pub(super) fn handle_releasedir(
         &self,
@@ -258,7 +477,10 @@ impl S3Filesystem {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.state.lock().unwrap().directories.remove(&fh.0);
+        let cursor = self.state.lock().unwrap().directories.remove(&fh.0);
+        if let Some(cursor) = cursor {
+            self.unpin_node(cursor.ino);
+        }
         reply.ok();
     }
     pub(super) fn handle_fsyncdir(

@@ -7,6 +7,7 @@ pub enum Purpose {
     InodeWrapping,
     InodeBody,
     DataChunk,
+    FileIndexNaming,
 }
 impl Purpose {
     fn label(&self) -> &'static [u8] {
@@ -15,6 +16,7 @@ impl Purpose {
             Self::InodeWrapping => b"EEDFS/v1/inode-wrapping",
             Self::InodeBody => b"EEDFS/v1/inode-body",
             Self::DataChunk => b"EEDFS/v1/data-chunk",
+            Self::FileIndexNaming => b"EEDFS/v1/file-index-name",
         }
     }
 }

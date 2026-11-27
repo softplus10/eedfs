@@ -8,35 +8,43 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn run_check(status: &str) -> (std::process::Output, String) {
+    run_checks(&[status])
+}
+
+fn run_checks(statuses: &[&str]) -> (std::process::Output, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let status = status.to_owned();
+    let statuses: Vec<_> = statuses.iter().map(|s| (*s).to_owned()).collect();
     let server = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "SDK did not connect");
-                    thread::sleep(Duration::from_millis(10));
+        let mut requests = String::new();
+        for status in statuses {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "SDK did not connect");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
                 }
-                Err(error) => panic!("accept failed: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "request ended before headers");
+                request.extend_from_slice(&buffer[..count]);
+                assert!(request.len() < 65536);
             }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 1024];
-        while !request.ends_with(b"\r\n\r\n") {
-            let count = stream.read(&mut buffer).unwrap();
-            assert!(count > 0, "request ended before headers");
-            request.extend_from_slice(&buffer[..count]);
-            assert!(request.len() < 65536);
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nx-amz-bucket-region: us-east-1\r\nConnection: close\r\n\r\n").unwrap();
+            requests.push_str(&String::from_utf8(request).unwrap());
         }
-        write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nx-amz-bucket-region: us-east-1\r\nConnection: close\r\n\r\n").unwrap();
-        String::from_utf8(request).unwrap()
+        requests
     });
     let output = Command::new(env!("CARGO_BIN_EXE_eedfs"))
         .args([
@@ -64,6 +72,17 @@ fn run_check(status: &str) -> (std::process::Output, String) {
         .output()
         .unwrap();
     (output, server.join().unwrap())
+}
+
+#[test]
+fn bucket_check_retries_transient_service_failure() {
+    let (output, requests) = run_checks(&["503 Service Unavailable", "200 OK"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.matches("HEAD /eedfs-test/").count(), 2);
 }
 
 #[test]

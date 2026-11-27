@@ -86,6 +86,48 @@ pub fn unlock_header(
     Ok(UnlockedHeader { master_key, config })
 }
 
+/// Replace one password wrapper without changing the master or naming keys.
+/// All keyslots are authenticated by the protected header, so reseal it too.
+pub fn change_password(
+    header: &Header,
+    slot_id: &[u8; 16],
+    old_password: &[u8],
+    new_password: &[u8],
+    parameters: &kdf::argon2id::Parameters,
+) -> Result<Header> {
+    if old_password.is_empty() || new_password.is_empty() {
+        return Err(Error::Invalid("empty password"));
+    }
+    let unlocked = unlock_header(header, old_password, slot_id)?;
+    let mut next = header.clone();
+    let slot = next.keyslots.iter_mut().find(|s| &s.id == slot_id).unwrap();
+    slot.kdf = parameters.algorithm()?;
+    let kek = kdf::argon2id::derive(new_password, &slot.kdf)?;
+    slot.wrapped_master_key = enc::region(slot.wrapped_master_key.algorithm.clone())?;
+    let aad = slot.wrapping_aad(&next.filesystem_id)?;
+    enc::seal(
+        &mut slot.wrapped_master_key,
+        &kek,
+        &aad,
+        &unlocked.master_key.0,
+    )?;
+    next.protected = enc::region(header.protected.algorithm.clone())?;
+    let key = kdf::derive(
+        &unlocked.master_key,
+        &next.filesystem_id,
+        kdf::Purpose::Header,
+    )?;
+    let aad = next.protected_aad()?;
+    enc::seal(
+        &mut next.protected,
+        &key,
+        &aad,
+        &Zeroizing::new(unlocked.config.encode()?),
+    )?;
+    next.encode()?;
+    Ok(next)
+}
+
 pub fn seal_inode(
     master_key: &SecretKey,
     inode_key: &SecretKey,

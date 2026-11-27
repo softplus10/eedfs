@@ -39,12 +39,13 @@ master --HKDF--> header configuration key
 master --HKDF--> inode wrapping key --AEAD unwrap--> inode key
 inode key --HKDF--> inode body key
 inode key --HKDF--> chunk data key
+inode key --HKDF--> file-index naming key
 ```
 
 HKDF-SHA256 is fixed by the format, not password-selectable. Salt is the
 16-byte filesystem ID. Info labels, without terminating NUL, are:
 `EEDFS/v1/header-config`, `EEDFS/v1/inode-wrapping`,
-`EEDFS/v1/inode-body`, `EEDFS/v1/data-chunk`.
+`EEDFS/v1/inode-body`, `EEDFS/v1/data-chunk`, `EEDFS/v1/file-index-name`.
 Purpose separation does not add stored per-object keys. The independent random
 inode naming key lives in the protected header; the independent random chunk
 naming key lives inside a file's encrypted inode. Master and inode keys are random
@@ -74,8 +75,12 @@ header unlock, wrapped inode keys, shared inode access, variable-size chunk
 reassembly, metadata/AAD/ciphertext tampering and resource rejection for both AEADs.
 No security claim follows from round-trip tests alone.
 
-No password rotation UI, key revocation, authenticated sharing grant, rollback
-protection, multi-object directory transactions or safe GC yet. The experimental
+Password replacement is available through `change-password`: it rewraps the same
+master key with fresh salt/nonces, reseals the keyslot-authenticating header and
+publishes one ETag CAS. It does not revoke cached headers/master keys. Other
+keyslots are preserved. There is no master-key rotation, key revocation,
+authenticated sharing grant, rollback protection, multi-object directory
+transaction or orphan/inode sweep yet. The experimental
 [S3/FUSE pipeline](s3-fuse.md) now uses these helpers for object storage.
 Password/KEK changes can rewrap the master key without rewriting file chunks.
 Changing an inode's body/chunk encryption profile requires rewriting chunks that

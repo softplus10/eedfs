@@ -11,9 +11,19 @@ and the [MinIO/filesystem benchmark](docs/benchmarks/s3-fuse-2026-11-24.md) for
 10 GiB and three-client results.
 The [namespace/sparse validation](docs/benchmarks/namespace-2026-11-26.md) records
 the current policies, three-client checks and a new 10 GiB run.
-Disjoint file writes merge, append uses first-CAS-wins, and open readers keep
-snapshots. Numeric uid/gid/mode/timestamps are persisted. Full POSIX semantics
-and safe GC remain future work. See the [policy contract](docs/concurrency-and-metadata.md).
+Disjoint cross-client writes merge and cross-client append uses first-CAS-wins.
+Local handles share one inode working state/spool per mount; independent opens
+and hard links observe local writes and resize before fsync. Successful inode CAS
+commits delete excluded chunks; readers refresh from the latest inode on a chunk
+404. Numeric uid/gid/mode/timestamps are persisted. Full POSIX semantics and
+online orphan/inode reclamation remain future work. Offline inspection and
+collection use [gc](docs/garbage-collection.md). See the [policy contract](docs/concurrency-and-metadata.md).
+Large directories promote to an [encrypted B+tree](docs/directory-index.md), with
+path-copy updates published by the same directory inode CAS.
+Large file references and last-writer ranges use an [encrypted file index](docs/file-index.md).
+Mounts have [local resource budgets and on-demand S3 usage reporting](docs/resources-and-usage.md).
+Read/private/shared memory mappings and msync are supported on S3 mounts; see
+the [mapping contract](docs/memory-mapping.md) for durability and remote conflicts.
 
 ## Development environment
 
@@ -29,7 +39,8 @@ sudo dnf install gcc fuse3
 ```
 
 With rustup installed, `rust-toolchain.toml` selects stable Rust, rustfmt, and
-clippy. Mounting requires access to `/dev/fuse`.
+clippy. Mounting requires access to `/dev/fuse`; S3 mounts also require kernel
+support for FUSE `DIRECT_IO_ALLOW_MMAP`.
 
 ```sh
 cargo build --locked
@@ -97,9 +108,10 @@ AWS S3 requires `s3:ListBucket` permission for this check; errors such as 403
 can indicate a missing bucket or insufficient access and are not always
 specific enough to distinguish the two.
 
-`--timeout-seconds` sets an overall deadline (default: 30 seconds), including
-SDK retries. The reusable `storage::s3::Connection` shares an SDK HTTP connection pool
-across clones. Its operation timeout bounds individual bucket checks.
+`--timeout-seconds` defaults to 120 seconds, including SDK retries (at most
+three attempts). It bounds the complete `s3 check` command and each individual
+S3 operation during a mount, not a whole file transfer. The reusable
+`storage::s3::Connection` shares an SDK HTTP connection pool across clones.
 
 ## Validation
 
@@ -124,7 +136,7 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 
 - [Header v4](docs/header-format.md): password keyslots, protected root inode ID
   and filesystem-wide inode naming configuration.
-- [Inode v6/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
+- [Inode v7/chunk v2](docs/object-format.md): wrapped per-inode key, common inode/chunk
   encryption profile, inline data or variable-size chunk runs. Chunk bytes contain
   only nonce and ciphertext/tag; names derive from allocation ID and chunk index.
 - [Crypto profiles and key hierarchy](docs/crypto.md): XChaCha20-Poly1305,
@@ -133,8 +145,32 @@ compatibility requires running `s3 check` with that provider's endpoint and cred
 `crypto::objects` creates/unlocks headers, seals/opens inode objects, and seals/opens
 chunks in memory, including shared access using a separately granted inode key.
 The [S3 volume layer](docs/s3-fuse.md) connects these helpers to writable FUSE
-and encrypted inline directories. Old experimental formats are incompatible and
-rejected. Basic POSIX attributes are included; encryption key lifecycle workflows remain future work. The cryptographic integration has not received a security audit.
+and encrypted directory indexes. Old experimental formats are incompatible and
+rejected. Basic POSIX attributes and password changes are included; master-key
+rotation and revocation remain future work. The cryptographic integration has
+not received a security audit.
+
+## Password changes
+
+With the S3 connection environment already configured:
+
+Run `eedfs change-password --prefix test/` to enter the current and new passwords
+with terminal echo disabled. New passwords are entered twice. `format`,
+`mount-s3`, and `gc` also prompt when `--password-file` (or
+`EEDFS_PASSWORD_FILE`) is omitted. For unattended use, provide password files:
+
+```sh
+eedfs change-password --prefix test/ \
+  --password-file /private/old-password \
+  --new-password-file /private/new-password
+```
+
+The command authenticates the current first password slot, wraps the same master
+key using fresh Argon2id salt/AEAD nonces, reseals the authenticated header and
+replaces it with one If-Match PUT. Concurrent header changes fail without rebasing.
+Inodes/chunks are unchanged and existing mounts keep working. This replaces a
+password wrapper; it does not revoke a master key or cached old header. Keep the
+new password file private. Additional keyslots, if present, are preserved.
 
 ## Source layout and writeback
 
@@ -173,7 +209,7 @@ disk I/O. Results measure CPU/allocation costs, not NAS throughput.
 
 Rename, rmdir, hard links, symlinks and object-free sparse ranges are implemented.
 Cross-directory rename is destination-first rather than atomic across directories.
-Key lifecycle workflows and safe reclamation remain separate work. Interrupted
+Master-key lifecycle workflows and online orphan/inode reclamation remain separate work. Interrupted
 namespace operations are intentionally not recovered.
 
 ## License

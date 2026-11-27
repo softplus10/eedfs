@@ -11,8 +11,9 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+rpassword = "7.5"
 env_logger = "0.11"
 log = "0.4"
 fuser = { version = "0.19", default-features = false }

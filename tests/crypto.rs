@@ -23,6 +23,47 @@ fn hex(s: &str) -> Vec<u8> {
         .collect()
 }
 #[test]
+fn password_change_preserves_master_and_naming_keys_and_authenticates_slot_edits() {
+    for suite in suites() {
+        let (header, original) =
+            objects::create_header(b"old", [9; 16], &enc::algorithm(suite).unwrap(), &params())
+                .unwrap();
+        let slot = header.keyslots[0].id;
+        let bytes = header.encode().unwrap();
+        let mut next_params = params();
+        next_params.salt = [8; 16];
+        assert!(objects::change_password(&header, &slot, b"wrong", b"new", &next_params).is_err());
+        assert!(objects::change_password(&header, &slot, b"old", b"", &next_params).is_err());
+        assert_eq!(header.encode().unwrap(), bytes);
+        let next = objects::change_password(&header, &slot, b"old", b"new", &next_params).unwrap();
+        assert_eq!(next.filesystem_id, header.filesystem_id);
+        assert_eq!(next.keyslots[0].id, slot);
+        assert_ne!(next.protected.nonce, header.protected.nonce);
+        assert_ne!(
+            next.keyslots[0].wrapped_master_key.nonce,
+            header.keyslots[0].wrapped_master_key.nonce
+        );
+        assert!(objects::unlock_header(&next, b"old", &slot).is_err());
+        let unlocked = objects::unlock_header(&next, b"new", &slot).unwrap();
+        let mut proof = enc::region(enc::algorithm(suite).unwrap()).unwrap();
+        enc::seal(
+            &mut proof,
+            &original.master_key,
+            b"unchanged master",
+            b"proof",
+        )
+        .unwrap();
+        assert_eq!(
+            &**enc::open(&proof, &unlocked.master_key, b"unchanged master").unwrap(),
+            b"proof"
+        );
+        assert_eq!(unlocked.config, original.config);
+        let mut tampered = next;
+        tampered.protected = header.protected.clone();
+        assert!(objects::unlock_header(&tampered, b"new", &slot).is_err());
+    }
+}
+#[test]
 fn rfc4231_hmac_sha256_vector() {
     assert_eq!(
         naming::hmac_sha256::digest(&[0x0b; 20], &[b"Hi There"]).to_vec(),
@@ -197,10 +238,16 @@ fn domains_and_contexts_are_distinct() {
     let key = SecretKey::from_bytes([2; 32]);
     let body = kdf::derive(&key, &fs, kdf::Purpose::InodeBody).unwrap();
     let data = kdf::derive(&key, &fs, kdf::Purpose::DataChunk).unwrap();
+    let index = kdf::derive(&key, &fs, kdf::Purpose::FileIndexNaming).unwrap();
+
     let a = enc::algorithm(1).unwrap();
     let mut r = enc::region(a).unwrap();
     enc::seal(&mut r, &body, b"", b"test").unwrap();
     assert!(enc::open(&r, &data, b"").is_err());
+    assert!(enc::open(&r, &index, b"").is_err());
+    let mut data_region = enc::region(enc::algorithm(1).unwrap()).unwrap();
+    enc::seal(&mut data_region, &data, b"", b"test").unwrap();
+    assert!(enc::open(&data_region, &index, b"").is_err());
     let cfg = NamingConfig {
         algorithm: naming::algorithm().unwrap(),
         key: [3; 32],

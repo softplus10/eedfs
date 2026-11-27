@@ -22,6 +22,7 @@ pub enum Error {
     Conflict,
     Exists,
     Missing,
+    ChunkMissing,
     NotDirectory,
     Invalid,
     TooLarge,
@@ -29,6 +30,8 @@ pub enum Error {
     Permission,
     IsDirectory,
     Unsupported,
+    NoSpace,
+    NoMemory,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -65,6 +68,11 @@ impl From<tokio::task::JoinError> for Error {
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
+mod directory_index;
+mod file_index;
+mod gc;
+pub mod resources;
+pub use gc::{GcOptions, GcReport};
 mod lease;
 mod metadata;
 mod namespace;
@@ -84,6 +92,7 @@ pub struct Volume {
     suite: Algorithm,
     pub chunk_size: usize,
     pub parallelism: usize,
+    pub resources: Arc<resources::Resources>,
 }
 #[derive(Clone)]
 pub struct Loaded {
@@ -91,6 +100,8 @@ pub struct Loaded {
     pub key: Arc<SecretKey>,
     pub suite: Algorithm,
     pub etag: String,
+    index: Option<Arc<file_index::IndexState>>,
+    _memory: Arc<resources::Memory>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Piece {
@@ -126,6 +137,56 @@ fn pieces(body: &InodeBody) -> Vec<Piece> {
     result
 }
 impl Volume {
+    pub(super) async fn delete_objects(&self, names: impl IntoIterator<Item = String>) {
+        let mut jobs = tokio::task::JoinSet::new();
+        let mut names = names.into_iter();
+        loop {
+            while jobs.len() < self.parallelism {
+                let Some(name) = names.next() else { break };
+                let connection = self.connection.clone();
+                jobs.spawn(async move {
+                    if let Err(error) = connection.delete(&name).await {
+                        log::warn!("retired object deletion failed for {name}: {error}");
+                    }
+                });
+            }
+            match jobs.join_next().await {
+                Some(Err(error)) => log::warn!("retired object deletion task failed: {error}"),
+                Some(Ok(())) => {}
+                None => break,
+            }
+        }
+    }
+    /// Replace the first password slot with one exact header CAS. A competing
+    /// header edit is reported, never rebased onto another password change.
+    pub async fn change_password(
+        connection: Connection,
+        prefix: &str,
+        old_password: &[u8],
+        new_password: &[u8],
+    ) -> Result<()> {
+        Self::validate_policy(prefix, inode::MAX_INLINE_SIZE, 1)?;
+        let name = format!("{prefix}header");
+        let stored = connection
+            .get(&name, crate::format::header::MAX_SIZE)
+            .await?
+            .ok_or(Error::Missing)?;
+        let header = Header::decode(&stored.bytes)?;
+        let next = objects::change_password(
+            &header,
+            &header.keyslots[0].id,
+            old_password,
+            new_password,
+            &kdf::argon2id::Parameters::recommended()?,
+        )?;
+        match connection
+            .put(&name, next.encode()?, Some(&stored.etag))
+            .await?
+        {
+            PutResult::Applied(_) => Ok(()),
+            PutResult::Conflict => Err(Error::Conflict),
+        }
+    }
     fn validate_policy(prefix: &str, chunk_size: usize, parallelism: usize) -> Result<()> {
         if prefix.is_empty()
             || !prefix.ends_with('/')
@@ -189,6 +250,7 @@ impl Volume {
             suite,
             chunk_size,
             parallelism,
+            resources: Arc::new(resources::Resources::default()),
         });
         volume
             .create_inode(root, inode::DIRECTORY, metadata)
@@ -226,6 +288,7 @@ impl Volume {
             suite: header.protected.algorithm,
             chunk_size,
             parallelism,
+            resources: Arc::new(resources::Resources::default()),
         });
         volume.load(volume.root).await?;
         Ok(volume)
@@ -254,6 +317,10 @@ impl Volume {
             .get(&name, inode::MAX_INODE_SIZE)
             .await?
             .ok_or(Error::Missing)?;
+        let memory = Arc::new(
+            self.resources
+                .memory(stored.bytes.len() as u64 * 8 + 4096)?,
+        );
         let object = InodeObject::decode(&stored.bytes)?;
         let (key, body) = objects::open_inode(&self.master, &self.fs_id, &name, &id, &object)?;
         Ok(Loaded {
@@ -261,6 +328,8 @@ impl Volume {
             key: Arc::new(key),
             suite: object.protected.algorithm,
             etag: stored.etag,
+            index: None,
+            _memory: memory,
         })
     }
     async fn publish(
@@ -319,6 +388,7 @@ impl Volume {
         metadata: crate::format::metadata::Metadata,
         content: Vec<u8>,
     ) -> Result<Loaded> {
+        let content_memory = content.len() as u64 * 8 + 4096;
         let mut loaded = Loaded {
             body: InodeBody {
                 id,
@@ -336,22 +406,21 @@ impl Volume {
             key: Arc::new(SecretKey::generate()?),
             suite: self.suite.clone(),
             etag: String::new(),
+            index: None,
+            _memory: Arc::new(self.resources.memory(content_memory)?),
         };
         loaded.etag = self.publish(&loaded, &loaded.body, None).await?;
         Ok(loaded)
     }
     pub async fn list(&self, id: [u8; 16]) -> Result<Vec<Entry>> {
-        let loaded = self.load(id).await?;
-        if loaded.body.deleted {
-            return Err(Error::Missing);
+        for _ in 0..16 {
+            let loaded = self.load(id).await?;
+            match self.directory(&loaded).await {
+                Err(Error::ChunkMissing) if self.inode_etag(id).await? != loaded.etag => continue,
+                result => return Ok(result?.entries),
+            }
         }
-        if loaded.body.kind != inode::DIRECTORY {
-            return Err(Error::NotDirectory);
-        }
-        let InodeContent::Inline(bytes) = loaded.body.content else {
-            return Err(Error::Invalid);
-        };
-        Ok(Directory::decode(&bytes)?.entries)
+        Err(Error::Conflict)
     }
     pub async fn update_metadata(
         &self,
@@ -373,6 +442,7 @@ impl Volume {
             if update.is_empty() {
                 return Ok(loaded);
             }
+            self.hydrate_file(&mut loaded).await?;
             let mut body = loaded.body.clone();
             update.apply(&body.metadata, actor)?;
             let different = update.different_fields(&desired, &body.metadata);
@@ -393,12 +463,8 @@ impl Volume {
                     ranges: vec![],
                 },
             )?;
-            match self.publish(&loaded, &body, Some(&loaded.etag)).await {
-                Ok(etag) => {
-                    loaded.body = body;
-                    loaded.etag = etag;
-                    return Ok(loaded);
-                }
+            match self.publish_file(&loaded, body).await {
+                Ok(next) => return Ok(next),
                 Err(Error::Conflict) => continue,
                 Err(e) => return Err(e),
             }
@@ -423,16 +489,14 @@ impl Volume {
         std::fs::remove_file(path)?; // anonymous plaintext spool, removed automatically on process exit
         let size = loaded.body.size()?;
         file.set_len(size)?;
-        if let InodeContent::Inline(bytes) = &loaded.body.content {
-            file.write_all_at(bytes, 0)?;
+        match &loaded.body.content {
+            InodeContent::Inline(bytes) => file.write_all_at(bytes, 0)?,
+            InodeContent::Indexed(root) if root.size <= inode::MAX_INLINE_SIZE as u64 => {
+                file.write_all_at(&root.inline, 0)?
+            }
+            _ => {}
         }
-        Ok(FileSession::new(
-            self.clone(),
-            loaded,
-            file,
-            size,
-            cache_dir.to_owned(),
-        ))
+        FileSession::new(self.clone(), loaded, file, size, cache_dir.to_owned())
     }
 }
 
@@ -478,8 +542,9 @@ fn record_mutation(body: &mut InodeBody, mut next: inode::Mutation) -> Result<()
     body.mutations
         .retain(|m| !m.ranges.is_empty() || m.size_changed || m.attribute_fields != 0);
     body.mutations.push(next);
-    if body.mutations.len() > inode::MAX_MUTATIONS
-        || body.mutations.iter().map(|m| m.ranges.len()).sum::<usize>() > 65536
+    if body.mutations.len() > crate::format::file_index::MAX_ENTRIES as usize
+        || body.mutations.iter().map(|m| m.ranges.len()).sum::<usize>()
+            > crate::format::file_index::MAX_ENTRIES as usize
     {
         return Err(Error::TooLarge);
     }

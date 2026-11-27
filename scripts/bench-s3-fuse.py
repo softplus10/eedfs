@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run real FUSE/S3 correctness checks and optional bounded filesystem benchmarks.
 Requires a disposable S3 bucket, Linux FUSE, provider S3_* env and a password file.
-Creates a unique prefix; never deletes remote objects (there is no GC yet).
+Creates a unique prefix and leaves it behind; file commits retire excluded chunks.
 """
-import argparse, concurrent.futures, errno, hashlib, json, os, pathlib, random, stat, subprocess, sys, time, uuid
+import argparse, concurrent.futures, errno, hashlib, json, os, pathlib, random, stat, subprocess, sys, threading, time, uuid
 
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--binary',default='target/release/eedfs')
@@ -27,7 +27,7 @@ processes={};logs=[];results=[]
 def start(i):
     mount=root/f'mount-{i}';cache=root/f'cache-{i}';mount.mkdir(exist_ok=True);cache.mkdir(exist_ok=True)
     log=open(root/f'client-{i}.log','ab');logs.append(log)
-    options=['--inode-poll-seconds','1']+(['--allow-other'] if os.geteuid()==0 else [])
+    options=['--inode-poll-seconds','1','--spool-mib',str(max(4096,2*a.large_mib,2*a.parallel_mib) if a.benchmark else 4096)]+(['--allow-other'] if os.geteuid()==0 else [])
     proc=subprocess.Popen([binary,'mount-s3',str(mount),*common,'--cache-dir',str(cache),*options],stdout=log,stderr=log)
     processes[i]=proc
     for _ in range(400):
@@ -74,10 +74,96 @@ def record(name,result):
     pathlib.Path(a.output).write_text(json.dumps({'prefix':prefix,'chunk_size':a.chunk_size,'parallelism':a.parallelism,'results':results},indent=2)+'\n')
 try:
     mounts=[start(i) for i in range(3)]
+    subprocess.run([sys.executable,str(pathlib.Path(__file__).with_name('check-mmap.py')),*map(str,mounts)],check=True)
     # Cross-client visibility, nested directories, overwrite, truncate and sparse gaps.
     (mounts[0]/'nested').mkdir()
     with open(mounts[0]/'nested'/'small','wb') as f:f.write(b'hello');f.flush();os.fsync(f.fileno())
     assert (mounts[1]/'nested'/'small').read_bytes()==b'hello'
+    # One inode working state per mount: separate opens and hard-link aliases
+    # see local writes/resize before fsync, with independent kernel FD flags.
+    (mounts[1]/'shared-local').write_bytes(b'abcdef')
+    shared=mounts[0]/'shared-local';local_fds=[]
+    try:
+        writer=os.open(shared,os.O_RDWR);local_fds.append(writer)
+        reader=os.open(shared,os.O_RDONLY);local_fds.append(reader)
+        os.pwrite(writer,b'local',0)
+        assert os.pread(reader,6,0)==b'localf'
+        joined=os.open(shared,os.O_RDWR);local_fds.append(joined)
+        assert os.pread(joined,6,0)==b'localf'
+        assert (mounts[2]/'shared-local').read_bytes()==b'abcdef'
+        os.ftruncate(joined,3)
+        assert shared.stat().st_size==os.fstat(writer).st_size==os.fstat(reader).st_size==3
+        assert os.pread(reader,6,0)==b'loc'
+        os.ftruncate(joined,8)
+        assert os.pread(reader,10,0)==b'loc'+bytes(5)
+        assert shared.stat().st_size==8 and (mounts[2]/'shared-local').stat().st_size==6
+        os.fsync(joined)
+        assert (mounts[2]/'shared-local').read_bytes()==b'loc'+bytes(5)
+        appender=os.open(shared,os.O_RDWR|os.O_APPEND);local_fds.append(appender)
+        assert os.write(appender,b'A')==1
+        os.pwrite(writer,b'P',0)
+        assert os.pread(reader,10,0)==b'Poc'+bytes(5)+b'A'
+        assert os.read(reader,2)==b'Po' and os.read(joined,1)==b'P'
+        duplicate=os.dup(reader);local_fds.append(duplicate)
+        assert os.read(duplicate,1)==b'c' and os.lseek(reader,0,os.SEEK_CUR)==3
+        os.link(shared,mounts[0]/'shared-alias')
+        alias=os.open(mounts[0]/'shared-alias',os.O_RDWR);local_fds.append(alias)
+        os.pwrite(alias,b'Q',1)
+        assert os.pread(reader,3,0)==b'PQc'
+        assert shared.stat().st_ino==(mounts[0]/'shared-alias').stat().st_ino
+        os.fsync(alias)
+        (mounts[0]/'shared-alias').unlink()
+    finally:
+        for fd in local_fds:os.close(fd)
+    # O_TRUNC updates existing readers of this mount too.
+    reader=os.open(shared,os.O_RDONLY);writer=None
+    try:
+        assert os.pread(reader,3,0)==b'PQc'
+        writer=os.open(shared,os.O_RDWR|os.O_TRUNC)
+        assert shared.stat().st_size==0 and os.pread(reader,10,0)==b''
+        os.write(writer,b'new')
+        assert os.pread(reader,10,0)==b'new'
+    finally:
+        if writer is not None:os.close(writer)
+        os.close(reader)
+    # A clean reopen adopts a remote commit for all handles of this mount.
+    reader=os.open(shared,os.O_RDONLY)
+    try:
+        assert os.pread(reader,3,0)==b'new'
+        (mounts[1]/'shared-local').write_bytes(b'remote')
+        joined=os.open(shared,os.O_RDONLY)
+        try:
+            assert os.pread(joined,6,0)==os.pread(reader,6,0)==b'remote'
+        finally:os.close(joined)
+    finally:os.close(reader)
+    # Cold concurrent opens must join one state, even before it has a handle.
+    # No worker closes/flushes until all local reads and the remote check finish.
+    for append in [False,True]:
+        name='local-append' if append else 'local-concurrent'
+        (mounts[1]/name).write_bytes(b'')
+        barrier=threading.Barrier(9,timeout=60)
+        records=[bytes([i+1])*32 for i in range(8)]
+        def local_worker(i):
+            fd=os.open(mounts[0]/name,os.O_RDWR|(os.O_APPEND if append else 0))
+            try:
+                barrier.wait()
+                if append:assert os.write(fd,records[i])==32
+                else:assert os.pwrite(fd,records[i],i*32)==32
+                barrier.wait()
+                observed=os.pread(fd,256,0)
+                if append:assert len(observed)==256 and sorted(observed[n:n+32] for n in range(0,256,32))==records
+                else:assert observed==b''.join(records)
+                barrier.wait()
+            finally:os.close(fd)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            jobs=[pool.submit(local_worker,i) for i in range(8)]
+            barrier.wait();barrier.wait()
+            assert (mounts[2]/name).read_bytes()==b''
+            barrier.wait()
+            for job in jobs:job.result()
+        observed=(mounts[2]/name).read_bytes()
+        if append:assert len(observed)==256 and sorted(observed[n:n+32] for n in range(0,256,32))==records
+        else:assert observed==b''.join(records)
     data=os.urandom(300_000)
     with open(mounts[0]/'check','wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
     fd=os.open(mounts[1]/'check',os.O_RDWR)
@@ -109,12 +195,25 @@ try:
     os.pwrite(d0,b'left',100);os.pwrite(d1,b'right',200);os.fsync(d0);os.fsync(d1);os.close(d0);os.close(d1)
     with open(mounts[2]/'check','rb') as f:
         f.seek(100);assert f.read(4)==b'left';f.seek(200);assert f.read(5)==b'right'
-    # A continuously open reader stays on its old snapshot through polling.
+    # Cached bytes stay old through polling; a chunk 404 refreshes the session.
     snapshot=os.open(mounts[0]/'check',os.O_RDONLY)
     old=os.pread(snapshot,6,0);writer=os.open(mounts[1]/'check',os.O_RDWR)
     os.pwrite(writer,b'newver',0);os.fsync(writer);os.close(writer)
     time.sleep(1.2)
     assert os.pread(snapshot,6,0)==old
+    # Force a cache miss in a superseded fifth chunk, then verify the first
+    # cached chunk is invalidated along with the rest of the old snapshot.
+    refresh_path=mounts[0]/'refresh-reader';refresh_len=5*a.chunk_size
+    refresh_writer=os.open(refresh_path,os.O_CREAT|os.O_EXCL|os.O_RDWR,0o644)
+    for _ in range(5):assert os.write(refresh_writer,bytes(a.chunk_size))==a.chunk_size
+    os.fsync(refresh_writer)
+    refresh_reader=os.open(mounts[1]/'refresh-reader',os.O_RDONLY)
+    assert os.pread(refresh_reader,5,0)==bytes(5)
+    os.pwrite(refresh_writer,b'first',0);os.pwrite(refresh_writer,b'last',refresh_len-4)
+    os.fsync(refresh_writer)
+    assert os.pread(refresh_reader,4,refresh_len-4)==b'last'
+    assert os.pread(refresh_reader,5,0)==b'first'
+    os.close(refresh_reader);os.close(refresh_writer)
     with open(mounts[0]/'check','rb') as f:assert f.read(6)==b'newver'
     os.close(snapshot)
     # Two appenders: the first successful CAS wins even if it wrote later.
@@ -217,7 +316,35 @@ try:
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:list(pool.map(namespace_worker,range(3)))
     assert list((mounts[2]/'race-a').iterdir())==[] and list((mounts[2]/'race-b').iterdir())==[]
     (mounts[0]/'race-a').rmdir();(mounts[1]/'race-b').rmdir()
-    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','close-commit','disjoint-merge','append-first-CAS','snapshot-polling','numeric-metadata-permissions','rename-replace','hard-link','open-unlink-write','symlink','rmdir','directory-move-cycle','objectless-16GiB-hole','three-client-merge-12-rounds','namespace-contention-36-rounds']})
+    # Promote beyond the inline limit with real entries from three mounts.
+    (mounts[0]/'indexed').mkdir()
+    def indexed_create(i):
+        path=mounts[i%3]/'indexed'/f'entry-{i:04}'
+        path.write_bytes(str(i).encode())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:list(pool.map(indexed_create,range(1200)))
+    assert len(list((mounts[2]/'indexed').iterdir()))==1200
+    for i in [0,63,64,1023,1024,1199]:assert (mounts[1]/'indexed'/f'entry-{i:04}').read_bytes()==str(i).encode()
+    os.rename(mounts[0]/'indexed'/'entry-0000',mounts[0]/'indexed'/'renamed')
+    (mounts[1]/'indexed'/'entry-1199').unlink()
+    assert (mounts[2]/'indexed'/'renamed').read_bytes()==b'0'
+    assert len(list((mounts[2]/'indexed').iterdir()))==1199
+    subprocess.run([sys.executable,str(pathlib.Path(__file__).with_name('check-scaling.py')),binary,password,prefix,str(mounts[0]),str(root)],check=True)
+    scaling=json.loads((root/'scaling-check.json').read_text())
+    record('scaling',scaling)
+    # Password changes update only the header; current mounts keep their keys.
+    changed_password=root/f'changed-password-{uuid.uuid4().hex}'
+    password_fd=os.open(changed_password,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+    try:os.write(password_fd,b'disposable changed integration password\n')
+    finally:os.close(password_fd)
+    subprocess.run([binary,'change-password','--prefix',prefix,'--password-file',password,'--new-password-file',str(changed_password)],check=True)
+    assert (mounts[0]/'nested'/'small').read_bytes()==b'hello'
+    stop(2)
+    rejected=subprocess.run([binary,'mount-s3',str(mounts[2]),*common,'--cache-dir',str(root/'cache-2')],capture_output=True,timeout=30)
+    assert rejected.returncode!=0 and not os.path.ismount(mounts[2]),rejected.stderr
+    common[common.index('--password-file')+1]=str(changed_password)
+    mounts[2]=start(2)
+    assert (mounts[2]/'indexed'/'renamed').read_bytes()==b'0'
+    record('correctness',{'passed':True,'checks':['cross-client','nested-directory','overwrite','truncate','sparse-gap','stale-writer-conflict','unlink','remount','partial-fsync-append','close-commit','disjoint-merge','append-first-CAS','snapshot-polling','retired-chunk-refresh','numeric-metadata-permissions','rename-replace','hard-link','open-unlink-write','symlink','rmdir','directory-move-cycle','objectless-16GiB-hole','three-client-merge-12-rounds','namespace-contention-36-rounds','indexed-directory-1200','password-change-and-remount','shared-local-inode','shared-local-truncate','shared-local-fd-flags-and-offsets','clean-open-refresh','concurrent-local-opens','local-atomic-append','mmap-shared-msync-13-checks']})
     if a.benchmark:
         # Same-directory metadata contention, with each writer on a different mount.
         def small_files(i):
@@ -257,6 +384,30 @@ try:
         elapsed=time.perf_counter()-t
         for i,r in enumerate(outputs):read_file(mounts[(i+1)%3]/f'parallel-{i}',r['bytes'],r['sha256'])
         record('parallel-write-fsync-3-clients',{'bytes':sum(r['bytes'] for r in outputs),'seconds':elapsed,'mib_s':sum(r['bytes'] for r in outputs)/1048576/elapsed,'clients':outputs,'verified':True})
+    # All clients stop before the offline reachability scan/sweep. Check that
+    # forgotten inodes/uploads are reclaimed and reachable indexed/mapped data
+    # still reads correctly after mounting again.
+    for i in list(processes):stop(i)
+    gc_command=[binary,'gc','--prefix',prefix,'--password-file',str(changed_password)]
+    missing_offline=subprocess.run([*gc_command,'--delete'],capture_output=True,text=True)
+    assert missing_offline.returncode!=0 and '--offline' in missing_offline.stderr
+    inspected=subprocess.run(gc_command,capture_output=True,text=True,check=True)
+    assert 'Deleted: 0 objects' in inspected.stdout,inspected.stdout
+    swept=subprocess.run([*gc_command,'--offline','--delete'],capture_output=True,text=True,check=True)
+    checked=subprocess.run(gc_command,capture_output=True,text=True,check=True)
+    assert 'Unreferenced: 0 objects' in checked.stdout,checked.stdout
+    mounts[2]=start(2)
+    assert (mounts[2]/'nested'/'small').read_bytes()==b'hello'
+    assert len(list((mounts[2]/'indexed').iterdir()))==1199
+    for i in [63,64,1023,1024]:assert (mounts[2]/'indexed'/f'entry-{i:04}').read_bytes()==str(i).encode()
+    assert (mounts[2]/'mmap-tests'/'stale-page').read_bytes()[:6]==b'remote'
+    disjoint=(mounts[2]/'mmap-tests'/'disjoint-then-stale').read_bytes()
+    page_size=os.sysconf('SC_PAGE_SIZE')
+    assert disjoint[:6]==b'local0' and disjoint[page_size+31:page_size+37]==b'remote'
+    with open(mounts[2]/'large-hole','rb') as f:f.seek((1<<33)-2);assert f.read(10)==bytes(2)+b'middle'+bytes(2)
+    assert read_file(mounts[2]/'indexed-file',scaling['file_bytes'],scaling['file_sha256'])['sha256']==scaling['file_sha256']
+    assert (mounts[2]/'resource-budget').stat().st_size==1048588
+    record('offline-gc',{'passed':True,'sweep':swept.stdout.splitlines(),'remount_verified':True})
 finally:
     for i in list(processes):stop(i)
     for log in logs:log.close()

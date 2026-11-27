@@ -12,7 +12,7 @@ use super::data_chunk::MAX_CHUNK_PLAINTEXT;
 use codec::{bounded_bytes, serialize_bytes};
 use std::fmt;
 
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 pub const FILE: u8 = 1;
 pub const DIRECTORY: u8 = 2;
 pub const SYMLINK: u8 = 3;
@@ -33,7 +33,7 @@ pub struct InodeObject {
 }
 
 /// Minimal plaintext inode. Its contents must be encrypted before upload.
-/// Includes numeric ownership, permissions and basic timestamps; no extent tree.
+/// Includes numeric ownership, permissions, timestamps and optional file index roots.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InodeBody {
     pub id: [u8; 16],
@@ -87,7 +87,7 @@ pub struct Hole {
     pub len: u64,
 }
 
-/// Persisted enum tags are fixed by schema v6: Inline=0, Chunks=1.
+/// Persisted enum tags are fixed by schema v7: Inline=0, Chunks=1, Indexed=2.
 /// Reordering/inserting variants is a format change, not an implementation detail.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InodeContent {
@@ -99,11 +99,13 @@ pub enum InodeContent {
         Vec<u8>,
     ),
     Chunks(ChunkedContent),
+    Indexed(Box<super::file_index::FileRoot>),
 }
 impl fmt::Debug for InodeContent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Inline(bytes) => f.debug_struct("Inline").field("len", &bytes.len()).finish(),
+            Self::Indexed(root) => f.debug_tuple("Indexed").field(root).finish(),
             Self::Chunks(chunks) => f
                 .debug_struct("Chunks")
                 .field("run_count", &chunks.runs.len())
@@ -134,10 +136,7 @@ pub struct ChunkRun {
 impl ChunkedContent {
     pub fn size(&self) -> Result<u64> {
         self.naming.algorithm.validate()?;
-        if (self.runs.is_empty() && self.holes.is_empty())
-            || self.holes.len() > MAX_CHUNK_REFERENCES
-            || self.runs.len() > MAX_CHUNK_REFERENCES
-        {
+        if self.runs.is_empty() && self.holes.is_empty() {
             return Err(FormatError::Invalid("chunk configuration"));
         }
         let mut count = 0usize;
@@ -152,7 +151,7 @@ impl ChunkedContent {
             count = count
                 .checked_add(run.plaintext_lengths.len())
                 .ok_or(FormatError::TooLarge)?;
-            if count > MAX_CHUNK_REFERENCES {
+            if count > super::file_index::MAX_ENTRIES as usize {
                 return Err(FormatError::TooLarge);
             }
             for &len in &run.plaintext_lengths {
@@ -204,6 +203,10 @@ impl InodeContent {
                 Ok(bytes.len() as u64)
             }
             Self::Chunks(chunks) => chunks.size(),
+            Self::Indexed(root) => {
+                root.validate(u64::MAX)?;
+                Ok(root.size)
+            }
         }
     }
 }
@@ -309,6 +312,23 @@ impl InodeBody {
         ranges.sort_unstable();
         if ranges.windows(2).any(|p| p[0].1 > p[1].0) {
             return Err(FormatError::Invalid("overlapping mutation ranges"));
+        }
+        if let InodeContent::Chunks(c) = &self.content
+            && (c.runs.len() > MAX_CHUNK_REFERENCES
+                || c.holes.len() > MAX_CHUNK_REFERENCES
+                || c.runs
+                    .iter()
+                    .map(|r| r.plaintext_lengths.len())
+                    .sum::<usize>()
+                    > MAX_CHUNK_REFERENCES)
+        {
+            return Err(FormatError::TooLarge);
+        }
+        if let InodeContent::Indexed(root) = &self.content {
+            if self.kind != FILE || !self.mutations.is_empty() {
+                return Err(FormatError::Invalid("indexed inode kind/history"));
+            }
+            root.validate(self.generation)?;
         }
         self.content.size()?;
         self.metadata.validate()?;

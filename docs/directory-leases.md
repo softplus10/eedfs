@@ -1,9 +1,11 @@
 # Namespace operations and inode-local leases
 
 FUSE rename, rmdir, regular-file hard links, symlink and readlink are implemented.
+Inline and indexed directories share the same lease protocol. Tree path copies
+are staged before a single directory CAS; see [directory indexes](directory-index.md).
 There is no operation ID, transaction journal, recovery worker or automatic
-roll-forward / rollback of interrupted namespace operations. Physical GC remains
-separate work.
+roll-forward / rollback of interrupted namespace operations. Orphan/inode
+reclamation remains separate work; file commits delete excluded chunks.
 
 ## Lease state
 
@@ -77,7 +79,9 @@ Replacing a destination preserves handles to the displaced inode in the same way
 Directory publication and a file's nlink update are separate S3 writes. A crash
 or failed request between them can leave an inaccurate count. Counts are for
 filesystem reporting, not a GC safety authority. Decrements saturate at zero so
-manually unlinking residual names is still possible after a partial operation. No objects are physically deleted.
+manually unlinking residual names is still possible after a partial operation.
+Namespace operations do not physically delete objects. File data commits delete
+excluded chunks; open handles reload the inode if a referenced chunk is missing.
 
 Symlinks store their raw nonempty target bytes inline in an encrypted inode
 (kind 3), bounded to 4096 bytes without NUL. The kernel resolves relative and

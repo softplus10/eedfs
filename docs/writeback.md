@@ -1,8 +1,9 @@
 # File writeback contract
 
 This document fixes the current write/fsync/append/error/close contract. The selected [concurrency and metadata policies](concurrency-and-metadata.md)
-extend this contract. Namespace transactions and GC remain separate work.
-Inode v6 stores ownership, permissions and timestamps.
+extend this contract. Namespace transactions remain separate work; orphan/inode
+sweeping is provided by the [offline collector](garbage-collection.md).
+Inode v7 stores ownership, permissions and timestamps.
 
 ## write
 
@@ -16,12 +17,13 @@ The per-file upload window is bounded by `--parallelism`; a full window applies
 backpressure before taking another chunk snapshot. Snapshot data is owned by the
 upload task, so a later overwrite cannot mutate bytes already being encrypted or
 sent. An overwritten snapshot is removed from the proposed references; its remote
-object can remain unreferenced until future GC. Existing-region overwrites remain
+object can remain unreferenced if it was never committed. Existing-region overwrites remain
 buffered until fsync; this change does not define a new random-write policy.
 
-The spool still keeps the open file's logical contents locally. Pipeline uploads
-do not implement cache eviction, encrypted local caching, or crash recovery of
-uncommitted writes. Reads and local spool writes may fail directly. A failure
+The spool retains accepted uncommitted bytes locally. Managed
+[resource budgets](resources-and-usage.md) bound resident spool ranges and buffers.
+Clean committed ranges can be evicted; unpublished dirty data is preserved. There
+is no encrypted local cache or crash recovery of uncommitted writes. Reads and local spool writes may fail directly. A failure
 discovered after bytes were buffered is latched for the next fsync/flush, even
 when the corresponding write returned its accepted byte count.
 
@@ -30,14 +32,22 @@ the stronger synchronous-write behavior.
 
 ## fsync and write generations
 
-The FUSE adapter serializes operations using a per-open-session mutex. The fsync
-cut is the moment it acquires that mutex: all previously accepted writes belong
-to its generation. A competing write through that same handle waits and enters
-the next generation after the barrier completes. Other opens use their own
-snapshots and synchronize through inode CAS/merge. Different opens have independent snapshots/sessions and can progress; duplicated
-descriptors of the same FUSE handle share the session.
+The FUSE adapter serializes operations using a per-inode working-state mutex
+within each mount. The fsync cut is the moment it acquires that mutex: all
+previously accepted writes through any local handle belong to its generation.
+A competing local write waits and enters the next generation after the barrier
+completes. Independent opens and hard-link aliases share data, size, attributes
+and spool; FD offsets/flags remain kernel-managed. Different inodes progress
+independently. Different mounts retain independent working states and synchronize
+through inode CAS/merge. A flush/fsync through any local handle commits the shared
+inode's pending generation, including data accepted through another handle.
 This implementation does not accept concurrent later writes into another buffer
-while the same handle's fsync is waiting.
+while that inode's fsync is waiting.
+
+For mapped writes, Linux drains the relevant dirty pages before sending FUSE
+fsync. The adapter's mutex boundary includes the page writes it has accepted;
+dirty pages still held only by the kernel are not yet spool writes. See
+[memory mapping](memory-mapping.md) for MS_SYNC, partial ranges and conflicts.
 
 For a successful fsync:
 
@@ -53,6 +63,37 @@ inode. An fsync on an unchanged, error-free session performs no new publication.
 Small inline files publish their bytes in the inode without separate data chunks.
 An fsync success relies on the object store honoring its successful PUT contract;
 local tests cannot establish a remote provider's storage durability guarantees.
+
+## Retired chunks and stale sessions
+
+After a successful inode CAS, compare the exact CAS predecessor's chunk object
+names with the new inode's names and delete only the excluded objects. Cleanup
+uses bounded parallel S3 DELETE requests. Failures are logged and do not turn a
+successful publication into a failed fsync. A crash before cleanup can leak
+objects; there is no cleanup journal or recovery worker. Uploaded but never
+committed chunks and unlinked inodes are not swept by this mechanism.
+
+Chunk names are never reused. A stale writer must rebase on the latest inode
+after a failed CAS; it cannot restore references from its old baseline. Mutation
+history detects overlaps and ABA without fetching retired data. Rebased commits
+retire references from their actual CAS predecessor, not their initial snapshot.
+
+Local inode working states do not retain remote chunks. A chunk GET returning 404 reloads the
+inode and retries against its new references, with bounded retries. A clean
+session replaces its entire spool/cache and adopts the new size, holes and
+metadata. A dirty session checks conflicts and reapplies only its local writes,
+resize and explicit attributes to the latest version. Conflicts preserve local
+changes and return EAGAIN. Upload errors remain latched across refresh.
+
+Internal sealing reads use one baseline; if a chunk disappears, the commit
+rebases the whole generation. If a missing chunk is still referenced by the same
+current inode ETag, the operation returns an I/O error instead of repeatedly
+reloading or substituting zeroes. Missing inodes remain distinct from missing
+chunk data. Cached/inline data can remain old until close or a refresh; no stable
+snapshot or whole-file version consistency across separate reads is promised.
+Within one mount, refresh replaces the state seen by all handles of that inode.
+New opens validate clean working states, while dirty states preserve accepted
+local changes and latched errors for the next commit barrier.
 
 ## Append after a partial fsync
 
@@ -70,9 +111,9 @@ Inline files can transition to chunked storage. Explicitly overwriting an old
 region still uses COW. This is per-client sequential append behavior, not a new
 cross-client atomic `O_APPEND` or same-file merge guarantee.
 
-Frequent small fsyncs create many small references. The existing flat 4,096-chunk
-limit still applies; the format needs a larger index before supporting arbitrary
-fragmentation. No minimum stored chunk size or per-file maximum was introduced.
+Frequent small fsyncs create many small references. Files promote into an
+[encrypted extent tree](file-index.md), bounded to 1,000,000 extent records and the
+configured managed-memory budget. No minimum stored chunk size was introduced.
 
 ## Errors and retry
 
@@ -94,7 +135,11 @@ some ambiguous requests; it is not a crash-recovery protocol.
 
 FUSE `flush` attempts the same commit barrier on descriptor close and returns its
 error to the caller. `release` disposes of handles/resources; it does not hide a
-flush failure by silently retrying publication. Applications must check close
+flush failure by silently retrying publication. A mapping can outlive descriptor
+close: new mapped writes arriving after that flush receive a best-effort commit
+at final release only if no writeback/barrier failure remains. Errors there can
+only be logged; explicit msync/fsync is required to acknowledge durability before
+unmapping. Applications must check close
 errors and use explicit fsync when they need a durability confirmation before
 closing. Crash/process termination before successful fsync/flush can lose local
 buffered writes; cleanup of anonymous spool files is automatic.
@@ -115,3 +160,24 @@ snapshots, truncate/re-extend zeroing, error delivery, retries and unchanged old
 append references. Real MinIO tests also verify 3 MiB fsync followed by 2 MiB
 append without replacing the first reference. Mounted-client checks exercise
 mid-stream fsync visibility and successful close without a final explicit fsync.
+
+Retirement tests cover excluded versus retained references, failed publication,
+failed/idempotent deletion, cleanup delayed across a later commit, same-chunk
+stale merges and overlap rejection. Refresh tests cover cached-index invalidation,
+inline/sparse EOF changes, local dirty data/metadata/resize preservation, latched
+upload errors and a missing chunk in the current committed version. Real MinIO
+checks exercise stale readers after retirement; the three-mount runner forces a
+404 beyond the prefetch window and verifies that earlier cached bytes refresh too.
+
+Transport fault tests also cover a lost chunk PUT response resolved by exact
+readback, a connection dropped before chunk publication with a successful retry,
+a lost inode PUT response confirmed before cleanup, an applied inode PUT whose
+failed readback leaves an explicitly ambiguous error without deleting old chunks,
+and a truncated chunk download that never enters the plaintext cache.
+
+Mounted local-sharing checks cover pre-fsync reads/stat/resize through separate
+opens and hard-link aliases, independent FD flags/offsets and dup offsets,
+O_TRUNC visibility to existing readers, clean-open adoption of remote versions,
+eight concurrent cold opens and eight local appenders. Workers keep handles open
+until all local reads succeed and another mount confirms that uncommitted data
+is still invisible. Closing/flushing then publishes the shared generation.

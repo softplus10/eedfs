@@ -202,7 +202,7 @@ fn inode_aad_binds_filesystem_location_and_wrapped_key() {
 }
 
 #[test]
-fn v6_matches_independently_encoded_fixtures() {
+fn v7_matches_independently_encoded_fixtures() {
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()
             .map(|v| u8::from_str_radix(v, 16).unwrap())
@@ -210,11 +210,11 @@ fn v6_matches_independently_encoded_fixtures() {
     }
     assert_eq!(
         body().encode().unwrap(),
-        hex(include_str!("fixtures/inode-inline-v6.hex"))
+        hex(include_str!("fixtures/inode-inline-v7.hex"))
     );
     assert_eq!(
         object().encode().unwrap(),
-        hex(include_str!("fixtures/inode-object-v6.hex"))
+        hex(include_str!("fixtures/inode-object-v7.hex"))
     );
     let b = InodeBody {
         content: InodeContent::Chunks(chunks()),
@@ -222,7 +222,7 @@ fn v6_matches_independently_encoded_fixtures() {
     };
     assert_eq!(
         b.encode().unwrap(),
-        hex(include_str!("fixtures/inode-chunks-v6.hex"))
+        hex(include_str!("fixtures/inode-chunks-v7.hex"))
     );
     assert_eq!(
         InodeBody::decode(&hex(include_str!("fixtures/inode-inline-v1.hex"))),

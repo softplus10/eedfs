@@ -1,4 +1,4 @@
-//! Minimal encrypted-inline directory payload. No links or cross-directory rename.
+//! Sorted inline directory payload; large directories use directory_tree pages.
 use super::{
     codec,
     header::FormatError,
@@ -18,23 +18,7 @@ pub struct Directory {
 }
 impl Directory {
     fn validate(&self) -> Result<(), FormatError> {
-        if self.entries.len() > 1024 {
-            return Err(FormatError::TooLarge);
-        }
-        let mut previous = "";
-        for e in &self.entries {
-            if e.name.is_empty()
-                || e.name.len() > 255
-                || e.name.contains(['/', '\0'])
-                || matches!(e.name.as_str(), "." | "..")
-                || e.name.as_str() <= previous
-                || !matches!(e.kind, FILE | DIRECTORY | SYMLINK)
-            {
-                return Err(FormatError::Invalid("directory entry"));
-            }
-            previous = &e.name;
-        }
-        Ok(())
+        validate_entries(&self.entries, 1024)
     }
     pub fn encode(&self) -> Result<Vec<u8>, FormatError> {
         self.validate()?;
@@ -45,4 +29,24 @@ impl Directory {
         d.validate()?;
         Ok(d)
     }
+}
+
+pub(crate) fn validate_entries(entries: &[Entry], limit: usize) -> Result<(), FormatError> {
+    if entries.len() > limit {
+        return Err(FormatError::TooLarge);
+    }
+    let mut previous = "";
+    for e in entries {
+        if e.name.is_empty()
+            || e.name.len() > 255
+            || e.name.contains(['/', '\0'])
+            || matches!(e.name.as_str(), "." | "..")
+            || e.name.as_str() <= previous
+            || !matches!(e.kind, FILE | DIRECTORY | SYMLINK)
+        {
+            return Err(FormatError::Invalid("directory entry"));
+        }
+        previous = &e.name;
+    }
+    Ok(())
 }

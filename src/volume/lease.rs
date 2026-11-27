@@ -3,8 +3,8 @@ use super::{Error, Loaded, Result, Volume};
 use crate::{
     crypto,
     format::{
-        directory::Directory,
-        inode::{self, DirectoryLease, InodeContent},
+        directory::{Directory, Entry},
+        inode::{self, DirectoryLease, InodeBody},
         metadata::Timestamp,
     },
 };
@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 /// synchronization service; mounts must run on clocks within this bound.
 pub const CLOCK_MARGIN: Duration = Duration::from_secs(2);
 pub const DEFAULT_DURATION: Duration = Duration::from_secs(30);
+type DirectoryEdit<'a> = (&'a str, Option<Entry>, Option<Entry>);
 
 /// An acquired lease's current ETag is private and never rebased automatically.
 /// A new acquisition gets a fresh owner token, even in the same process.
@@ -141,12 +142,60 @@ impl Volume {
             return Err(Error::Missing);
         }
         let mut body = lease.loaded.body.clone();
+        let (content, retired) = self.prepare_directory(&lease.loaded, directory).await?;
+        lease.check_owner_time()?;
         body.nlink = 2 + directory
             .entries
             .iter()
             .filter(|e| e.kind == inode::DIRECTORY)
             .count() as u32;
-        body.content = InodeContent::Inline(directory.encode()?);
+        body.content = content;
+        self.publish_leased_directory(lease, body, retired).await
+    }
+    /// Stage a batch of path copies and publish them with one exact lease CAS.
+    /// This preserves same-directory rename atomicity without a full tree read.
+    pub(super) async fn edit_leased_directory(
+        &self,
+        lease: &mut Lease,
+        edits: &[DirectoryEdit<'_>],
+    ) -> Result<()> {
+        lease.check_owner_time()?;
+        let mut staged = lease.loaded.clone();
+        let mut retired = Vec::new();
+        for (name, expected, next) in edits {
+            let (content, excluded) = self
+                .prepare_directory_edit(&staged, name, expected, next.clone())
+                .await?;
+            staged.body.content = content;
+            staged.body.nlink = staged
+                .body
+                .nlink
+                .checked_sub(u32::from(
+                    expected
+                        .as_ref()
+                        .is_some_and(|e| e.kind == inode::DIRECTORY),
+                ))
+                .and_then(|n| {
+                    n.checked_add(u32::from(
+                        next.as_ref().is_some_and(|e| e.kind == inode::DIRECTORY),
+                    ))
+                })
+                .ok_or(Error::TooLarge)?;
+            retired.extend(excluded);
+        }
+        self.publish_leased_directory(lease, staged.body, retired)
+            .await
+    }
+    async fn publish_leased_directory(
+        &self,
+        lease: &mut Lease,
+        mut body: InodeBody,
+        retired: Vec<String>,
+    ) -> Result<()> {
+        lease.check_owner_time()?;
+        if lease.loaded.body.deleted {
+            return Err(Error::Missing);
+        }
         body.generation = body.generation.checked_add(1).ok_or(Error::TooLarge)?;
         body.metadata.mtime = Timestamp::now();
         body.metadata.ctime = body.metadata.mtime;
@@ -155,6 +204,7 @@ impl Volume {
             .await?;
         lease.loaded.body = body;
         lease.loaded.etag = etag;
+        self.delete_objects(retired).await;
         // A slow response does not imply rollback: the caller must stop using
         // an expired handle, including when the conditional PUT was applied.
         lease.check_owner_time()
@@ -172,10 +222,7 @@ impl Volume {
     }
     pub(super) async fn retire_directory(&self, lease: &mut Lease) -> Result<()> {
         lease.check_owner_time()?;
-        let InodeContent::Inline(bytes) = &lease.loaded.body.content else {
-            return Err(Error::Invalid);
-        };
-        if !Directory::decode(bytes)?.entries.is_empty() {
+        if !self.directory_is_empty(&lease.loaded)? {
             return Err(Error::NotEmpty);
         }
         let mut body = lease.loaded.body.clone();

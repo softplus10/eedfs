@@ -70,6 +70,63 @@ async fn conditional_put_rejects_stale_versions() {
     assert_eq!(c.get(&key, 1).await.unwrap().unwrap().bytes, vec![2]);
     assert!(c.get(&key, 0).await.is_err());
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable real S3/MinIO bucket"]
+async fn offline_gc_reports_sweeps_and_preserves_live_data() {
+    use eedfs::volume::GcOptions;
+    let c = connection();
+    let prefix = prefix();
+    let volume = Volume::format(c.clone(), prefix.clone(), b"gc integration", 128 * 1024, 4)
+        .await
+        .unwrap();
+    let loaded = volume
+        .create(volume.root, "live", inode::FILE)
+        .await
+        .unwrap();
+    let id = loaded.body.id;
+    let cache = std::env::temp_dir().join(format!("eedfs-gc-{}", std::process::id()));
+    let mut file = volume.file(loaded, &cache).unwrap();
+    file.write(0, &vec![7; 150_000]).await.unwrap();
+    file.commit().await.unwrap();
+    drop(file);
+    let unused = format!("{prefix}{}", "c".repeat(64));
+    let PutResult::Applied(old) = c.put(&unused, vec![1], None).await.unwrap() else {
+        panic!()
+    };
+    let PutResult::Applied(_) = c.put(&unused, vec![2], Some(&old)).await.unwrap() else {
+        panic!()
+    };
+    assert!(c.delete_checked(&unused, &old).await.is_err());
+    assert_eq!(c.get(&unused, 1).await.unwrap().unwrap().bytes, vec![2]);
+    let report = volume.collect_garbage(GcOptions::default()).await.unwrap();
+    assert_eq!(report.unreferenced_objects, 1);
+    assert_eq!(report.deleted_objects, 0);
+    assert_eq!(report.logical_file_bytes, 150_000);
+    let report = volume
+        .collect_garbage(GcOptions {
+            delete: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.deleted_objects, 1);
+    assert!(c.get(&unused, 1).await.unwrap().is_none());
+    assert_eq!(
+        volume
+            .collect_garbage(GcOptions::default())
+            .await
+            .unwrap()
+            .unreferenced_objects,
+        0
+    );
+    let mut file = volume.file(volume.load(id).await.unwrap(), &cache).unwrap();
+    assert_eq!(file.read(0, 150_000).await.unwrap(), vec![7; 150_000]);
+    drop(file);
+    // Ordinary deletion remains idempotent for already missing objects.
+    c.delete(&unused).await.unwrap();
+    std::fs::remove_dir(cache).unwrap();
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a disposable real S3/MinIO bucket"]
 async fn persistence_cow_sparse_truncate_conflicts_and_directory_merge() {
@@ -209,7 +266,7 @@ async fn partial_fsync_append_keeps_previously_committed_chunk_references() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a disposable real S3/MinIO bucket"]
-async fn three_clients_merge_disjoint_bytes_and_keep_reader_snapshot() {
+async fn three_clients_merge_disjoint_bytes_and_refresh_retired_reader_snapshot() {
     let c = connection();
     let prefix = prefix();
     let password = b"merge test";
@@ -243,7 +300,8 @@ async fn three_clients_merge_disjoint_bytes_and_keep_reader_snapshot() {
     b.commit().await.unwrap();
     pins.poll_once().await;
     assert!(pins.latest(id).unwrap().body.generation > snapshot.body.generation);
-    assert_eq!(reader.read(100, 5).await.unwrap(), vec![0; 5]);
+    assert_eq!(reader.read(100, 5).await.unwrap(), b"first");
+    assert_eq!(reader.read(200, 6).await.unwrap(), b"second");
     let mut fresh = third.file(third.load(id).await.unwrap(), &cache).unwrap();
     assert_eq!(fresh.read(100, 5).await.unwrap(), b"first");
     assert_eq!(fresh.read(200, 6).await.unwrap(), b"second");

@@ -25,7 +25,14 @@ impl S3Filesystem {
         } else {
             self.getattr_inner(ino)
         } {
-            Ok(a) => reply.attr(&TTL, &a),
+            Ok(a) => reply.attr(
+                if a.kind == FileType::Directory {
+                    &DIRECTORY_TTL
+                } else {
+                    &TTL
+                },
+                &a,
+            ),
             Err(e) => reply.error(errno(e)),
         }
     }
@@ -44,12 +51,18 @@ impl S3Filesystem {
         let result = (|| {
             let p = self.node(parent)?;
             let name = name.to_str().ok_or(Error::Invalid)?;
-            let loaded = self.runtime.block_on(self.volume.create_with_metadata(
-                p.id,
-                name,
-                inode::FILE,
-                self.creation_metadata(p.id, owner, mode, umask, inode::FILE)?,
-            ))?;
+            let loaded = self
+                .runtime
+                .block_on(self.volume.create_inheriting_metadata(
+                    p.id,
+                    name,
+                    inode::FILE,
+                    eedfs::format::metadata::Metadata::new(
+                        owner.uid,
+                        owner.gid,
+                        (mode & !umask & 0o7777) as u16,
+                    ),
+                ))?;
             let ino = self.register(
                 parent,
                 &Entry {
@@ -57,9 +70,32 @@ impl S3Filesystem {
                     id: loaded.body.id,
                     kind: inode::FILE,
                 },
+            )?;
+            // CREATE already owns the just-published inode. Avoid another S3
+            // GET solely to build its reply (one network round trip per file).
+            let attr = self.attr(
+                ino,
+                inode::FILE,
+                loaded.body.size()?,
+                &loaded.body.metadata,
+                loaded.body.nlink,
+                allocation_size(&loaded.body),
             );
-            let fh = self.add_handle(ino, Some(loaded), OpenFlags(flags))?;
-            Ok::<_, Error>((self.getattr_handle(ino, fh)?, fh))
+            let fh = match self.add_handle(ino, Some(loaded), OpenFlags(flags)) {
+                Ok(fh) => fh,
+                Err(e) => {
+                    self.forget_node(ino, 1);
+                    return Err(e);
+                }
+            };
+            match attr {
+                Ok(attr) => Ok((attr, fh)),
+                Err(e) => {
+                    self.release_handle(fh);
+                    self.forget_node(ino, 1);
+                    Err(e)
+                }
+            }
         })();
         match result {
             Ok((a, fh)) => reply.created(&TTL, &a, Generation(0), fh, FopenFlags::FOPEN_DIRECT_IO),
@@ -92,11 +128,14 @@ impl S3Filesystem {
     ) {
         let result = (|| {
             let s = self.handle(fh)?;
-            self.runtime
-                .block_on(s.lock().unwrap().read(offset, size as usize))
+            let memory = self.volume.resources.work_memory(u64::from(size) + 256)?;
+            let bytes = self
+                .runtime
+                .block_on(s.lock().unwrap().read(offset, size as usize))?;
+            Ok::<_, Error>((bytes, memory))
         })();
         match result {
-            Ok(bytes) => reply.data(&bytes),
+            Ok((bytes, _memory)) => reply.data(&bytes),
             Err(e) => reply.error(errno(e)),
         }
     }
@@ -107,25 +146,38 @@ impl S3Filesystem {
         fh: FileHandle,
         offset: u64,
         data: &[u8],
-        _write_flags: WriteFlags,
+        write_flags: WriteFlags,
         flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         let result = (|| {
-            let s = self.handle(fh)?;
+            // Mapped page writeback is positioned I/O, even if its chosen file
+            // handle was opened O_APPEND/O_SYNC. The following FSYNC, including
+            // msync(MS_SYNC), supplies the commit barrier for mapped writes.
+            let page_writeback = write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
+            let (s, origin) = if page_writeback {
+                let (session, generation) = self.cache_handle(fh)?;
+                (session, Some(generation))
+            } else {
+                (self.handle(fh)?, None)
+            };
             let mut session = s.lock().unwrap();
-            // Kernel supplies the append offset; cross-client append is still OCC.
-            let offset = if flags.0 & libc::O_APPEND != 0 {
+            let offset = if !page_writeback && flags.0 & libc::O_APPEND != 0 {
                 session.size
             } else {
                 offset
             };
-            let n = self.runtime.block_on(session.write(offset, data))?;
+            let n = match origin {
+                Some(generation) => self
+                    .runtime
+                    .block_on(session.write_cached(offset, data, generation))?,
+                None => self.runtime.block_on(session.write(offset, data))?,
+            };
             if n > 0 && _req.uid() != Some(0) {
                 session.clear_setid();
             }
-            if flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0 {
+            if !page_writeback && flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0 {
                 self.runtime.block_on(session.commit())?;
             }
             Ok::<_, Error>(n)
@@ -171,10 +223,7 @@ impl S3Filesystem {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let removed = self.state.lock().unwrap().handles.remove(&fh.0);
-        if let Some(s) = removed {
-            self.snapshots.unpin(s.lock().unwrap().base.body.id);
-        }
+        self.release_handle(fh);
         reply.ok();
     }
     pub(super) fn handle_setattr(
@@ -244,6 +293,7 @@ impl S3Filesystem {
             };
             let mut session = s.lock().unwrap();
             if let Some(size) = size {
+                self.runtime.block_on(session.prepare())?;
                 session.resize(size)?;
                 if _kill_suid_gid || actor.0 != 0 {
                     session.clear_setid();

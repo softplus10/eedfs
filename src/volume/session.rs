@@ -1,4 +1,4 @@
-//! Per-open-file write generations and bounded immutable-chunk upload pipeline.
+//! Client working-state generations and bounded immutable-chunk upload pipeline.
 use super::{Error, Loaded, MetadataUpdate, Piece, Result, Volume, pieces};
 use crate::{
     crypto::{self, naming, objects},
@@ -12,6 +12,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
+    os::fd::AsRawFd,
     os::unix::fs::FileExt,
     path::PathBuf,
     sync::Arc,
@@ -19,7 +20,7 @@ use std::{
 use tokio::task::{JoinError, JoinSet};
 use zeroize::Zeroizing;
 
-type ReadTasks = JoinSet<Result<(usize, Piece, Zeroizing<Vec<u8>>)>>;
+type ReadTasks = JoinSet<Result<(u64, Piece, Zeroizing<Vec<u8>>, super::resources::Memory)>>;
 type UploadResult = std::result::Result<(Piece, Result<()>), JoinError>;
 struct Staged {
     piece: Piece,
@@ -30,10 +31,12 @@ pub struct FileSession {
     volume: Arc<Volume>,
     pub base: Loaded,
     file: File,
+    spool: super::resources::Spool,
+    working_memory: super::resources::Memory,
     pub size: u64,
     visible_size: u64,
-    cached: BTreeSet<usize>,
-    dirty_base: BTreeSet<usize>,
+    cached: BTreeSet<u64>,
+    dirty_base: BTreeSet<u64>,
     staged: BTreeMap<u64, Staged>,
     uploads: JoinSet<(Piece, Result<()>)>,
     upload_error: Option<Error>,
@@ -50,15 +53,35 @@ pub struct FileSession {
     resized: bool,
     holes: Vec<(u64, u64)>,
     resize_ranges: Vec<(u64, u64)>,
+    local_generations: BTreeSet<u64>,
+    cached_pending: bool,
+    failed_barrier: bool,
 }
 impl FileSession {
+    /// A new local handle joins this inode's working state. Clean states can
+    /// adopt a newer server version; pending writes/errors must remain visible
+    /// to all local handles until their commit barrier resolves them.
+    pub async fn validate_open(&mut self) -> Result<()> {
+        if !self.changed
+            && self.upload_error.is_none()
+            && self.uploads.is_empty()
+            && self.volume.inode_etag(self.base.body.id).await? != self.base.etag
+        {
+            self.refresh(false).await?;
+        }
+        Ok(())
+    }
     pub(super) fn new(
         volume: Arc<Volume>,
         base: Loaded,
         file: File,
         size: u64,
         cache_dir: PathBuf,
-    ) -> Self {
+    ) -> Result<Self> {
+        let mut spool = super::resources::Spool::new(volume.resources.clone());
+        if size <= inode::MAX_INLINE_SIZE as u64 {
+            spool.charge(0, size)?;
+        }
         let metadata = base.body.metadata.clone();
         let holes = match &base.body.content {
             InodeContent::Chunks(c) => c
@@ -68,7 +91,10 @@ impl FileSession {
                 .collect(),
             _ => vec![],
         };
-        Self {
+        let working_memory = volume.resources.memory(0)?;
+        Ok(Self {
+            working_memory,
+            spool,
             volume,
             base,
             file,
@@ -92,14 +118,94 @@ impl FileSession {
             resized: false,
             holes,
             resize_ranges: vec![],
+            local_generations: BTreeSet::new(),
+            cached_pending: false,
+            failed_barrier: false,
+        })
+    }
+    fn account_metadata(&mut self, extra: usize) -> Result<()> {
+        let count = self.cached.len()
+            + self.dirty_base.len()
+            + self.staged.len()
+            + self.holes.len()
+            + self.ranges.len()
+            + self.resize_ranges.len()
+            + extra;
+        self.working_memory
+            .resize((count as u64).checked_mul(128).ok_or(Error::TooLarge)?)
+    }
+    fn evict_clean_spool(&mut self) -> Result<()> {
+        if self.changed || self.size <= inode::MAX_INLINE_SIZE as u64 {
+            return Ok(());
         }
+        // Failure to punch leaves the accounting intact; it must not turn a
+        // confirmed remote commit into a failed barrier.
+        let result = unsafe {
+            libc::fallocate(
+                self.file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                0,
+                self.size as i64,
+            )
+        };
+        if result == 0 {
+            self.spool.clear();
+            self.cached.clear();
+            self.account_metadata(0)?;
+        }
+        Ok(())
+    }
+    fn charge_spool(&mut self, start: u64, end: u64) -> Result<()> {
+        self.spool.charge(start, end)
+    }
+    pub async fn prepare(&mut self) -> Result<()> {
+        if !matches!(self.base.body.content, InodeContent::Indexed(_)) {
+            return self.account_metadata(0);
+        }
+        self.volume.hydrate_file(&mut self.base).await?;
+        self.prune_local_generations();
+        if let InodeContent::Chunks(c) = &self.base.body.content {
+            self.holes.extend(c.holes.iter().filter_map(|h| {
+                let end = (h.offset + h.len).min(self.visible_size.min(self.size));
+                (h.offset < end).then_some((h.offset, end))
+            }));
+            self.holes.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = vec![];
+            for (a, b) in self.holes.drain(..) {
+                if let Some(last) = merged.last_mut()
+                    && a <= last.1
+                {
+                    last.1 = last.1.max(b);
+                } else {
+                    merged.push((a, b));
+                }
+            }
+            self.holes = merged;
+        }
+        self.account_metadata(0)
     }
     async fn ensure(&mut self, start: u64, end: u64) -> Result<()> {
-        let InodeContent::Chunks(config) = &self.base.body.content else {
-            return Ok(());
+        match self.ensure_once(start, end).await {
+            Err(Error::NoSpace) if !self.changed => {
+                self.evict_clean_spool()?;
+                self.ensure_once(start, end).await
+            }
+            result => result,
+        }
+    }
+    async fn ensure_once(&mut self, start: u64, end: u64) -> Result<()> {
+        let (naming, all, _index_memory) = match &self.base.body.content {
+            InodeContent::Chunks(c) => (c.naming.clone(), pieces(&self.base.body), vec![]),
+            InodeContent::Indexed(root) if root.size > inode::MAX_INLINE_SIZE as u64 => {
+                let naming = root.naming.clone();
+                let (pieces, memory) = self
+                    .volume
+                    .indexed_read_pieces(&self.base, start, end)
+                    .await?;
+                (naming, pieces, memory)
+            }
+            _ => return Ok(()),
         };
-        let naming = config.naming.clone();
-        let all = pieces(&self.base.body);
         let selected: Vec<_> = all
             .iter()
             .enumerate()
@@ -109,11 +215,22 @@ impl FileSession {
         let mut wanted = BTreeSet::new();
         for i in selected {
             for (j, p) in all.iter().enumerate().skip(i).take(4) {
-                if !self.cached.contains(&j) && p.offset < self.visible_size {
+                if !self.cached.contains(&p.offset) && p.offset < self.visible_size {
                     wanted.insert(j);
                 }
             }
         }
+        let reservation: Vec<_> = wanted
+            .iter()
+            .map(|&i| {
+                let p = &all[i];
+                (
+                    p.offset,
+                    (p.offset + u64::from(p.len)).min(self.visible_size),
+                )
+            })
+            .collect();
+        self.spool.charge_many(&reservation)?;
         let mut tasks = JoinSet::new();
         for i in wanted {
             let piece = all[i].clone();
@@ -122,15 +239,18 @@ impl FileSession {
             let suite = self.base.suite.clone();
             let volume = self.volume.clone();
             tasks.spawn(async move {
+                let memory = volume
+                    .resources
+                    .work_memory(u64::from(piece.len) * 3 + 256)?;
                 let bytes = volume
                     .connection
-                    .get(&name, piece.len as usize + 64)
+                    .get_data(&name, piece.len as usize + 64)
                     .await?
-                    .ok_or(Error::Missing)?
+                    .ok_or(Error::ChunkMissing)?
                     .bytes;
                 let plaintext =
                     objects::open_chunk(&key, &volume.fs_id, &name, &suite, piece.len, &bytes)?;
-                Ok::<_, Error>((i, piece, plaintext))
+                Ok::<_, Error>((piece.offset, piece, plaintext, memory))
             });
             if tasks.len() >= self.volume.parallelism {
                 self.receive_read(&mut tasks).await?;
@@ -142,13 +262,25 @@ impl FileSession {
         Ok(())
     }
     async fn receive_read(&mut self, tasks: &mut ReadTasks) -> Result<()> {
-        let (i, p, bytes) = tasks.join_next().await.ok_or(Error::Invalid)???;
+        let (i, p, bytes, _memory) = tasks.join_next().await.ok_or(Error::Invalid)???;
         let len = (self.visible_size - p.offset).min(u64::from(p.len)) as usize;
         self.file.write_all_at(&bytes[..len], p.offset)?;
+        self.account_metadata(1)?;
         self.cached.insert(i);
         Ok(())
     }
     pub async fn read(&mut self, offset: u64, size: usize) -> Result<Vec<u8>> {
+        for _ in 0..16 {
+            match self.read_once(offset, size).await {
+                Err(Error::ChunkMissing) => self.refresh(true).await?,
+                result => return result,
+            }
+        }
+        Err(Error::Conflict)
+    }
+    // Internal reads stay on one baseline. Publication must rebase the entire
+    // generation, rather than changing its references halfway through sealing.
+    async fn read_once(&mut self, offset: u64, size: usize) -> Result<Vec<u8>> {
         let len = self.size.saturating_sub(offset).min(size as u64) as usize;
         if len == 0 {
             return Ok(Vec::new());
@@ -161,6 +293,62 @@ impl FileSession {
     /// Buffer first, then snapshot complete append chunks for background upload.
     /// Waiting for a queue slot is bounded-memory backpressure, not publication.
     pub async fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
+        self.write_from(offset, bytes, None).await
+    }
+    /// Page cache dirties may predate a clean-open refresh. Check their oldest
+    /// possible origin so writeback cannot silently replace a remote edit.
+    pub async fn write_cached(&mut self, offset: u64, bytes: &[u8], origin: u64) -> Result<usize> {
+        let result = self.write_from(offset, bytes, Some(origin)).await;
+        match &result {
+            Ok(n) if *n > 0 => self.cached_pending = true,
+            Err(_) => self.failed_barrier = true,
+            _ => {}
+        }
+        result
+    }
+    /// munmap can deliver new pages after the final descriptor's flush. Only
+    /// those unattempted generations may commit on release; failed barriers
+    /// require an explicit retry and must not be hidden by teardown.
+    pub fn needs_release_commit(&self) -> bool {
+        self.changed && self.cached_pending && !self.failed_barrier
+    }
+    async fn write_from(
+        &mut self,
+        offset: u64,
+        bytes: &[u8],
+        origin: Option<u64>,
+    ) -> Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        for _ in 0..16 {
+            match self.prepare().await {
+                Err(Error::ChunkMissing) => {
+                    self.refresh(true).await?;
+                    continue;
+                }
+                result => result?,
+            }
+            if let Some(origin) = origin {
+                let end = offset
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(Error::TooLarge)?;
+                if self.base.body.mutations.iter().any(|m| {
+                    m.generation > origin
+                        && !self.local_generations.contains(&m.generation)
+                        && m.ranges.iter().any(|&(a, b)| a < end && offset < b)
+                }) {
+                    return Err(Error::Conflict);
+                }
+            }
+            match self.write_once(offset, bytes).await {
+                Err(Error::ChunkMissing) => self.refresh(true).await?,
+                result => return result,
+            }
+        }
+        Err(Error::Conflict)
+    }
+    async fn write_once(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -171,15 +359,29 @@ impl FileSession {
         if self.ranges.len() >= 65536 {
             return Err(Error::TooLarge);
         }
+        if matches!(self.spool.charge(offset, end), Err(Error::NoSpace)) && !self.changed {
+            self.evict_clean_spool()?;
+        }
+        self.spool.charge(offset, end)?;
         self.ensure(offset, end).await?;
+        self.charge_spool(offset, end)?;
+        let affected: Vec<_> = pieces(&self.base.body)
+            .into_iter()
+            .filter(|p| {
+                p.offset < end
+                    && p.offset + u64::from(p.len) > offset
+                    && !self.dirty_base.contains(&p.offset)
+            })
+            .collect();
+        self.account_metadata(affected.len() + 8)?;
         if offset > self.size {
             self.add_hole(self.size, offset);
         }
         self.remove_hole(offset, end);
         self.file.write_all_at(bytes, offset)?;
-        for (i, p) in pieces(&self.base.body).iter().enumerate() {
+        for p in &affected {
             if p.offset < end && p.offset + u64::from(p.len) > offset {
-                self.dirty_base.insert(i);
+                self.dirty_base.insert(p.offset);
             }
         }
         // Uploaded snapshots are immutable: later writes invalidate references,
@@ -259,7 +461,9 @@ impl FileSession {
         if size == self.size {
             return Ok(());
         }
+        self.account_metadata(4)?;
         self.file.set_len(size)?;
+        self.spool.truncate(size);
         self.resize_ranges
             .push((self.size.min(size), self.size.max(size)));
         if size > self.size {
@@ -331,8 +535,8 @@ impl FileSession {
         let mut result: Vec<_> = pieces(&self.base.body)
             .into_iter()
             .enumerate()
-            .filter(|(i, p)| {
-                !self.dirty_base.contains(i)
+            .filter(|(_, p)| {
+                !self.dirty_base.contains(&p.offset)
                     && p.offset + u64::from(p.len) <= self.visible_size
                     && p.offset + u64::from(p.len) <= self.size
             })
@@ -388,7 +592,12 @@ impl FileSession {
             return Ok(());
         }
         self.ensure_naming()?;
-        let plain = Zeroizing::new(self.read(offset, len as usize).await?);
+        self.account_metadata(1)?;
+        let memory = self
+            .volume
+            .resources
+            .work_memory(u64::from(len) * 3 + 256)?;
+        let plain = Zeroizing::new(self.read_once(offset, len as usize).await?);
         let piece = Piece {
             offset,
             len,
@@ -404,6 +613,7 @@ impl FileSession {
         let volume = self.volume.clone();
         let upload_piece = piece.clone();
         self.uploads.spawn(async move {
+            let _memory = memory;
             let result = async {
                 let fs = volume.fs_id;
                 let encrypt_name = name.clone();
@@ -411,7 +621,7 @@ impl FileSession {
                     objects::seal_chunk(&key, &fs, &encrypt_name, &suite, &plain)
                 })
                 .await??;
-                match volume.connection.put(&name, bytes, None).await? {
+                match volume.connection.put_data(&name, bytes, None).await? {
                     PutResult::Applied(_) => Ok(()),
                     PutResult::Conflict => {
                         Err(Error::Other("immutable chunk name collision".into()))
@@ -438,7 +648,7 @@ impl FileSession {
             return Ok(());
         }
         let append_start = match &self.base.body.content {
-            InodeContent::Chunks(_) => self.base.body.size()?,
+            InodeContent::Chunks(_) | InodeContent::Indexed(_) => self.base.body.size()?,
             _ => 0,
         };
         for (mut start, end) in self.gaps() {
@@ -470,6 +680,9 @@ impl FileSession {
         }
     }
     pub fn allocated_size(&self) -> u64 {
+        if let InodeContent::Indexed(root) = &self.base.body.content {
+            return root.allocated.min(self.size);
+        }
         self.size - self.holes.iter().map(|(a, b)| b - a).sum::<u64>()
     }
     pub fn is_dirty(&self) -> bool {
@@ -486,22 +699,68 @@ impl FileSession {
         Ok(())
     }
     /// Append/resize conflicts retain first-CAS-wins. Ordinary disjoint byte
-    /// writes are three-way merged, including two edits inside the same chunk.
+    /// writes merge using persisted mutation history, including within one chunk.
     pub async fn commit(&mut self) -> Result<()> {
+        let result = self.commit_generation().await;
+        self.failed_barrier = result.is_err();
+        if result.is_ok() {
+            self.cached_pending = false;
+        }
+        result
+    }
+    async fn commit_generation(&mut self) -> Result<()> {
         for _ in 0..16 {
             match self.commit_once().await {
                 Ok(()) => return Ok(()),
-                Err(Error::Conflict) => {
-                    let candidate = self.rebase().await?;
-                    *self = candidate;
-                }
+                Err(Error::Conflict) => self.refresh(false).await?,
+                Err(Error::ChunkMissing) => self.refresh(true).await?,
                 Err(e) => return Err(e),
             }
         }
         Err(Error::Conflict)
     }
-    async fn rebase(&mut self) -> Result<Self> {
-        let latest = self.volume.load(self.base.body.id).await?;
+    /// Retire cached bytes as a unit, preserving only explicit local changes.
+    /// Drain uploads first so replacing the session cannot hide a latched error.
+    async fn refresh(&mut self, missing_chunk: bool) -> Result<()> {
+        self.drain_uploads().await;
+        let mut unavailable = None;
+        for _ in 0..16 {
+            let latest = self.volume.load(self.base.body.id).await?;
+            if (missing_chunk && latest.etag == self.base.etag)
+                || unavailable.as_ref() == Some(&latest.etag)
+            {
+                // The current committed version itself is missing data. A reload
+                // cannot repair it; do not loop or turn it into zero-filled bytes.
+                return Err(Error::ChunkMissing);
+            }
+            let etag = latest.etag.clone();
+            let candidate = if self.changed {
+                self.rebase(latest).await
+            } else {
+                self.volume.file(latest, &self.cache_dir)
+            };
+            match candidate {
+                Ok(mut candidate) => {
+                    candidate.cached_pending = self.cached_pending;
+                    candidate.failed_barrier = self.failed_barrier;
+                    candidate.local_generations = std::mem::take(&mut self.local_generations);
+                    candidate.prune_local_generations();
+                    if let Some(error) = self.upload_error.take() {
+                        candidate.record_error(error);
+                    }
+                    *self = candidate;
+                    return Ok(());
+                }
+                // Another successful commit may have retired this baseline
+                // while we were loading it. Retry without dropping local edits.
+                Err(Error::ChunkMissing) => unavailable = Some(etag),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Conflict)
+    }
+    async fn rebase(&self, mut latest: Loaded) -> Result<Self> {
+        self.volume.hydrate_file(&mut latest).await?;
         let original_size = self.base.body.size()?;
         let latest_size = latest.body.size()?;
         let different_fields = self
@@ -546,8 +805,6 @@ impl FileSession {
             &latest.body.metadata,
             &self.metadata,
         )?;
-        let mut original = self.volume.file(self.base.clone(), &self.cache_dir)?;
-        let mut remote = self.volume.file(latest.clone(), &self.cache_dir)?;
         let mut candidate = self.volume.file(latest, &self.cache_dir)?;
         if self.resized {
             if self.visible_size < original_size {
@@ -562,16 +819,9 @@ impl FileSession {
             let mut offset = start;
             while offset < end {
                 let len = (end - offset).min(1024 * 1024) as usize;
-                let comparable = original_size.saturating_sub(offset).min(len as u64) as usize;
-                if comparable > 0
-                    && original.read(offset, comparable).await?
-                        != remote.read(offset, comparable).await?
-                {
-                    return Err(Error::Conflict);
-                }
                 let mut bytes = Zeroizing::new(vec![0; len]);
                 self.file.read_exact_at(&mut bytes, offset)?;
-                candidate.write(offset, &bytes).await?;
+                candidate.write_once(offset, &bytes).await?;
                 offset += len as u64;
             }
         }
@@ -589,6 +839,10 @@ impl FileSession {
         Ok(candidate)
     }
     async fn commit_once(&mut self) -> Result<()> {
+        if !self.changed && self.upload_error.is_none() && self.uploads.is_empty() {
+            return Ok(());
+        }
+        self.prepare().await?;
         self.poll_uploads();
         if self.changed
             && let Err(e) = self.seal_gaps(true).await
@@ -603,11 +857,11 @@ impl FileSession {
             return Ok(());
         }
         let content = if self.size <= inode::MAX_INLINE_SIZE as u64 {
-            InodeContent::Inline(self.read(0, self.size as usize).await?)
+            InodeContent::Inline(self.read_once(0, self.size as usize).await?)
         } else {
             self.ensure_naming()?;
             let next = self.reusable();
-            if next.len() > inode::MAX_CHUNK_REFERENCES {
+            if next.len() > crate::format::file_index::MAX_ENTRIES as usize {
                 return Err(Error::TooLarge);
             }
             // No dangling reference may become visible, even after task failure.
@@ -680,12 +934,10 @@ impl FileSession {
                 },
             )?;
         }
-        let etag = self
-            .volume
-            .publish(&self.base, &body, Some(&self.base.etag))
-            .await?;
-        self.base.body = body;
-        self.base.etag = etag;
+        let retired = self.retired_chunks(&body)?;
+        self.base = self.volume.publish_file(&self.base, body).await?;
+        self.local_generations.insert(self.base.body.generation);
+        self.prune_local_generations();
         self.visible_size = self.size;
         self.cached.clear();
         self.dirty_base.clear();
@@ -700,7 +952,44 @@ impl FileSession {
         self.append_generation = false;
         self.resized = false;
         self.resize_ranges.clear();
+        // This CAS succeeded. Future writers must build on its references;
+        // stale writers cannot republish chunks retired from this predecessor.
+        self.volume.delete_objects(retired).await;
+        // Shrinking accounting after publication cannot fail.
+        let _ = self.account_metadata(0);
+        self.evict_clean_spool()?;
         Ok(())
+    }
+
+    fn retired_chunks(&self, next: &inode::InodeBody) -> Result<BTreeSet<String>> {
+        let names = |body: &inode::InodeBody| -> Result<BTreeSet<String>> {
+            let InodeContent::Chunks(config) = &body.content else {
+                return Ok(BTreeSet::new());
+            };
+            pieces(body)
+                .iter()
+                .map(|p| self.volume.chunk_name(&config.naming, p))
+                .collect()
+        };
+        let mut retired = names(&self.base.body)?;
+        let retained = names(next)?;
+        retired.retain(|name| !retained.contains(name));
+        Ok(retired)
+    }
+    fn prune_local_generations(&mut self) {
+        if matches!(self.base.body.content, InodeContent::Indexed(_)) {
+            return;
+        }
+        // Only generations still represented by the bounded mutation map can
+        // affect a later cached write; covered history never reappears.
+        let retained: BTreeSet<_> = self
+            .base
+            .body
+            .mutations
+            .iter()
+            .map(|m| m.generation)
+            .collect();
+        self.local_generations.retain(|g| retained.contains(g));
     }
 }
 

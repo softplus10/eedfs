@@ -10,7 +10,22 @@ use std::{ffi::OsStr, time::SystemTime};
 impl Filesystem for S3Filesystem {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         let _ = config.set_max_write(1024 * 1024);
+        // Combine directory enumeration and attribute lookup when the kernel
+        // requests it. Plain name-only enumeration remains available.
+        let _ = config
+            .add_capabilities(InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO);
+        // Keep normal I/O direct, but let the kernel manage mapped pages.
+        // The high capability bit is carried in the extended INIT reply.
+        config
+            .add_capabilities(InitFlags::FUSE_INIT_EXT | InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP)
+            .map_err(|_| {
+                log::error!("S3 mounts require Linux FUSE DIRECT_IO_ALLOW_MMAP support");
+                std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)
+            })?;
         Ok(())
+    }
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.forget_node(ino, nlookup);
     }
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         self.handle_lookup(_req, parent, name, reply)
@@ -226,6 +241,16 @@ impl Filesystem for S3Filesystem {
         reply: ReplyDirectory,
     ) {
         self.handle_readdir(_req, _ino, fh, offset, reply)
+    }
+    fn readdirplus(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectoryPlus,
+    ) {
+        self.handle_readdirplus(req, ino, fh, offset, reply)
     }
     fn releasedir(
         &self,
