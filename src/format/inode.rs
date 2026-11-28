@@ -20,8 +20,8 @@ pub const MAX_MUTATIONS: usize = 4096;
 pub const MAX_INLINE_SIZE: usize = 64 * 1024;
 pub const MAX_CHUNK_REFERENCES: usize = 4096;
 pub const MAX_INODE_SIZE: usize = MAX_METADATA_SIZE;
-const INODE_MAGIC: &[u8; 8] = b"EEDFSINO";
-const BODY_MAGIC: &[u8; 8] = b"EEDFSINB";
+const INODE_MAGIC: &[u8; 8] = b"COCFSINO";
+const BODY_MAGIC: &[u8; 8] = b"COCFSINB";
 
 /// Public S3 inode envelope: a wrapped per-inode key and a separately sealed body.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,7 +231,7 @@ impl InodeObject {
         self.wrapped_inode_key.validate_descriptor()?;
         validate_extensions(&self.extensions)?;
         object_aad(
-            b"EEDFS/inode-key\0",
+            b"CoCryptFS/inode-key\0",
             VERSION,
             filesystem_id,
             object_key,
@@ -248,7 +248,7 @@ impl InodeObject {
         self.protected.validate_descriptor()?;
         validate_extensions(&self.extensions)?;
         object_aad(
-            b"EEDFS/inode-body\0",
+            b"CoCryptFS/inode-body\0",
             VERSION,
             filesystem_id,
             object_key,

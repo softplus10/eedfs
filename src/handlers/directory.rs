@@ -2,7 +2,7 @@
 // These signatures intentionally mirror the FUSE callbacks.
 #![allow(clippy::too_many_arguments)]
 use super::state::*;
-use eedfs::{
+use cocryptfs::{
     format::{directory::Entry, inode},
     volume::Error,
 };
@@ -64,7 +64,7 @@ impl S3Filesystem {
                     p.id,
                     name,
                     inode::DIRECTORY,
-                    eedfs::format::metadata::Metadata::new(
+                    cocryptfs::format::metadata::Metadata::new(
                         owner.uid,
                         owner.gid,
                         (mode & !umask & 0o7777) as u16,

@@ -1,5 +1,5 @@
 //! Explicit password files for automation, or hidden input on the controlling TTY.
-use eedfs::storage::s3::ConnectionError;
+use cocryptfs::storage::s3::ConnectionError;
 use std::path::Path;
 use zeroize::Zeroizing;
 

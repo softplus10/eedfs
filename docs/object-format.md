@@ -8,7 +8,7 @@ object publication and basic POSIX metadata. Multi-object transactions remain de
 
 ## Inode envelope
 
-`EEDFSINO` + the 16-byte framing convention in [header format](header-format.md),
+`COCFSINO` + the 16-byte framing convention in [header format](header-format.md),
 version 7, followed by canonical Postcard:
 
 ```
@@ -24,7 +24,7 @@ Distinct body and chunk keys are derived from that inode key using HKDF. Wrappin
 and body profiles are independently described by the envelope. Creation currently
 uses the selected AEAD for both. Both supported AEADs are allowed for wrapping.
 
-Decrypted body has its own `EEDFSINB` frame, version 7:
+Decrypted body has its own `COCFSINB` frame, version 7:
 
 ```
 InodeBody {
@@ -92,11 +92,11 @@ AAD is raw domain then canonical Postcard tuple. Version is u16; expected chunk
 plaintext length is u32. `metadata` in these contexts excludes the region's own
 ciphertext. Every context binds the trusted filesystem ID and exact S3 key.
 
-- `EEDFS/inode-key\0`: `(7, fs_id, object_key,
+- `CoCryptFS/inode-key\0`: `(7, fs_id, object_key,
   (wrapping_algorithm, wrapping_nonce, extensions))`.
-- `EEDFS/inode-body\0`: `(7, fs_id, object_key,
+- `CoCryptFS/inode-body\0`: `(7, fs_id, object_key,
   (full_wrapped_key_region, body_algorithm, body_nonce, extensions))`.
-- `EEDFS/data-chunk\0`: `(2, fs_id, object_key,
+- `CoCryptFS/data-chunk\0`: `(2, fs_id, object_key,
   (common_algorithm, chunk_nonce, expected_plaintext_length))`.
 
 Chunk AAD excludes logical file offset/generation to allow immutable reuse.

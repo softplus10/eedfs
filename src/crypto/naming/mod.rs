@@ -24,7 +24,7 @@ pub fn inode(
     validate(config)?;
     Ok(hmac_sha256::name(
         &config.key,
-        &[b"EEDFS/inode-name/v1\0", filesystem_id, inode_id],
+        &[b"CoCryptFS/inode-name/v1\0", filesystem_id, inode_id],
     ))
 }
 pub fn chunk(
@@ -37,7 +37,7 @@ pub fn chunk(
     Ok(hmac_sha256::name(
         &config.key,
         &[
-            b"EEDFS/chunk-name/v1\0",
+            b"CoCryptFS/chunk-name/v1\0",
             filesystem_id,
             allocation_id,
             &index.to_le_bytes(),

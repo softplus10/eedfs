@@ -1,6 +1,6 @@
 //! S3 object baseline without FUSE, encryption or a local staging file.
 use clap::Parser;
-use eedfs::{
+use cocryptfs::{
     crypto,
     storage::s3::{Connection, ConnectionConfig, PutResult},
 };

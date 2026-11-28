@@ -44,8 +44,8 @@ inode key --HKDF--> file-index naming key
 
 HKDF-SHA256 is fixed by the format, not password-selectable. Salt is the
 16-byte filesystem ID. Info labels, without terminating NUL, are:
-`EEDFS/v1/header-config`, `EEDFS/v1/inode-wrapping`,
-`EEDFS/v1/inode-body`, `EEDFS/v1/data-chunk`, `EEDFS/v1/file-index-name`.
+`CoCryptFS/v1/header-config`, `CoCryptFS/v1/inode-wrapping`,
+`CoCryptFS/v1/inode-body`, `CoCryptFS/v1/data-chunk`, `CoCryptFS/v1/file-index-name`.
 Purpose separation does not add stored per-object keys. The independent random
 inode naming key lives in the protected header; the independent random chunk
 naming key lives inside a file's encrypted inode. Master and inode keys are random
@@ -58,8 +58,8 @@ implicitly wiped. Rust cannot guarantee removal of every compiler/register copy.
 
 Exact HMAC message inputs, concatenated as bytes:
 
-- inode: `b"EEDFS/inode-name/v1\0" || filesystem_id[16] || inode_id[16]`
-- chunk: `b"EEDFS/chunk-name/v1\0" || filesystem_id[16] || allocation_id[16] || index:u64LE`
+- inode: `b"CoCryptFS/inode-name/v1\0" || filesystem_id[16] || inode_id[16]`
+- chunk: `b"CoCryptFS/chunk-name/v1\0" || filesystem_id[16] || allocation_id[16] || index:u64LE`
 
 Output: full 32-byte digest rendered as 64 lowercase hex characters, without
 an inode/chunk type prefix. Inputs after the domain have fixed widths. The S3

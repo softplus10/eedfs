@@ -1,4 +1,4 @@
-//! Building blocks for EEDFS.
+//! Building blocks for CoCryptFS.
 
 pub mod format;
 pub mod storage;

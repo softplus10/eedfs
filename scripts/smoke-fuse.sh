@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run after `cargo build`; requires /dev/fuse and fusermount3.
 set -eu
-binary=${EEDFS_BINARY:-./target/debug/eedfs}
+binary=${COCRYPTFS_BINARY:-./target/debug/cocryptfs}
 [ -c /dev/fuse ] || { echo '/dev/fuse is required' >&2; exit 1; }
 command -v fusermount3 >/dev/null
 command -v mountpoint >/dev/null
@@ -34,7 +34,7 @@ until mountpoint -q "$work/mnt"; do
     sleep 0.1
 done
 ls -la "$work/mnt"
-printf 'EEDFS development filesystem\nS3 persistence and encryption are not connected to this FUSE scaffold yet.\n' > "$work/expected"
+printf 'CoCryptFS development filesystem\nS3 persistence and encryption are not connected to this FUSE scaffold yet.\n' > "$work/expected"
 cmp "$work/expected" "$work/mnt/README.txt"
 if touch "$work/mnt/should-fail" 2>/dev/null; then
     echo 'read-only filesystem accepted a write' >&2

@@ -7,11 +7,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use eedfs::storage::s3::{Connection, ConnectionConfig, ConnectionError};
+use cocryptfs::storage::s3::{Connection, ConnectionConfig, ConnectionError};
 use fuser::{Config, MountOption};
 
 #[derive(Parser)]
-#[command(version, about = "EEDFS development filesystem")]
+#[command(
+    version,
+    about = "CoCryptFS: client-side encrypted filesystem with multi-client access"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -27,9 +30,9 @@ enum Command {
     ChangePassword {
         #[command(flatten)]
         s3: S3Args,
-        #[arg(long, default_value = "eedfs/")]
+        #[arg(long, default_value = "cocryptfs/")]
         prefix: String,
-        #[arg(long, env = "EEDFS_PASSWORD_FILE")]
+        #[arg(long, env = "COCRYPTFS_PASSWORD_FILE")]
         password_file: Option<PathBuf>,
         #[arg(long)]
         new_password_file: Option<PathBuf>,
@@ -38,9 +41,9 @@ enum Command {
     Gc {
         #[command(flatten)]
         s3: S3Args,
-        #[arg(long, default_value = "eedfs/")]
+        #[arg(long, default_value = "cocryptfs/")]
         prefix: String,
-        #[arg(long, env = "EEDFS_PASSWORD_FILE")]
+        #[arg(long, env = "COCRYPTFS_PASSWORD_FILE")]
         password_file: Option<PathBuf>,
         /// Delete unreachable objects instead of reporting only.
         #[arg(long, requires = "offline")]
@@ -92,7 +95,7 @@ enum S3Command {
     Usage {
         #[command(flatten)]
         s3: S3Args,
-        #[arg(long, default_value = "eedfs/")]
+        #[arg(long, default_value = "cocryptfs/")]
         prefix: String,
         #[arg(long, default_value_t = 1_000_000)]
         max_objects: usize,
@@ -121,10 +124,10 @@ struct S3Args {
 struct VolumeArgs {
     #[command(flatten)]
     s3: S3Args,
-    #[arg(long, default_value = "eedfs/")]
+    #[arg(long, default_value = "cocryptfs/")]
     prefix: String,
     /// Password file; omit for hidden terminal input. A trailing LF/CRLF is removed.
-    #[arg(long, env = "EEDFS_PASSWORD_FILE")]
+    #[arg(long, env = "COCRYPTFS_PASSWORD_FILE")]
     password_file: Option<PathBuf>,
     /// Writer policy, not a persisted per-file maximum.
     #[arg(long, default_value_t=8*1024*1024)]
@@ -158,12 +161,14 @@ fn main() -> Result<(), ConnectionError> {
                 password_input::read(password_file.as_deref(), "Current volume password: ", false)?;
             let new_password =
                 password_input::read(new_password_file.as_deref(), "New volume password: ", true)?;
-            tokio::runtime::Runtime::new()?.block_on(eedfs::volume::Volume::change_password(
-                connection(s3)?,
-                &prefix,
-                &old_password,
-                &new_password,
-            ))?;
+            tokio::runtime::Runtime::new()?.block_on(
+                cocryptfs::volume::Volume::change_password(
+                    connection(s3)?,
+                    &prefix,
+                    &old_password,
+                    &new_password,
+                ),
+            )?;
             println!("Volume password changed");
             Ok(())
         }
@@ -179,7 +184,7 @@ fn main() -> Result<(), ConnectionError> {
                 password_input::read(password_file.as_deref(), "Volume password: ", false)?;
             let max_objects = usize::try_from(max_objects)?;
             let report = tokio::runtime::Runtime::new()?.block_on(async {
-                let volume = eedfs::volume::Volume::open(
+                let volume = cocryptfs::volume::Volume::open(
                     connection(s3)?,
                     prefix,
                     &password,
@@ -188,7 +193,7 @@ fn main() -> Result<(), ConnectionError> {
                 )
                 .await?;
                 volume
-                    .collect_garbage(eedfs::volume::GcOptions {
+                    .collect_garbage(cocryptfs::volume::GcOptions {
                         delete,
                         max_objects,
                     })
@@ -238,14 +243,14 @@ fn main() -> Result<(), ConnectionError> {
                 if args.create_bucket {
                     c.create_bucket().await?;
                 }
-                eedfs::volume::Volume::format_with_metadata(
+                cocryptfs::volume::Volume::format_with_metadata(
                     c,
                     args.prefix,
                     &password,
                     args.chunk_size,
                     args.parallelism,
                     // POSIX effective IDs; no remote identity mapping.
-                    eedfs::format::metadata::Metadata::new(
+                    cocryptfs::format::metadata::Metadata::new(
                         unsafe { libc::geteuid() },
                         unsafe { libc::getegid() },
                         0o755,
@@ -285,7 +290,7 @@ fn main() -> Result<(), ConnectionError> {
                 return Err("cache directory must be outside mountpoint".into());
             }
             let runtime = tokio::runtime::Runtime::new()?;
-            let volume = runtime.block_on(eedfs::volume::Volume::open(
+            let volume = runtime.block_on(cocryptfs::volume::Volume::open(
                 connection(args.s3)?.with_request_limit(s3_requests)?,
                 args.prefix,
                 &password_input::read(args.password_file.as_deref(), "Volume password: ", false)?,
@@ -294,7 +299,7 @@ fn main() -> Result<(), ConnectionError> {
             ))?;
             volume
                 .resources
-                .configure(eedfs::volume::resources::Limits {
+                .configure(cocryptfs::volume::resources::Limits {
                     memory_bytes: memory_mib
                         .checked_mul(1024 * 1024)
                         .ok_or("memory limit overflow")?,
@@ -315,8 +320,8 @@ fn main() -> Result<(), ConnectionError> {
                 config.acl = fuser::SessionACL::All;
             }
             config.mount_options = vec![
-                MountOption::FSName("eedfs-s3".into()),
-                MountOption::Subtype("eedfs".into()),
+                MountOption::FSName("cocryptfs-s3".into()),
+                MountOption::Subtype("cocryptfs".into()),
                 MountOption::RW,
                 MountOption::NoAtime,
                 MountOption::DefaultPermissions,
@@ -389,8 +394,8 @@ fn mount(mountpoint: PathBuf) -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let mut config = Config::default();
     config.mount_options = vec![
-        MountOption::FSName("eedfs".into()),
-        MountOption::Subtype("eedfs".into()),
+        MountOption::FSName("cocryptfs".into()),
+        MountOption::Subtype("cocryptfs".into()),
         MountOption::RO,
         MountOption::DefaultPermissions,
         MountOption::NoDev,

@@ -8,8 +8,8 @@ use super::codec::{bounded, bounded_bytes, decode_value, encode_value, serialize
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-const MAGIC: &[u8; 8] = b"EEDFSHDR";
-const CONFIG_MAGIC: &[u8; 8] = b"EEDFSCFG";
+const MAGIC: &[u8; 8] = b"COCFSHDR";
+const CONFIG_MAGIC: &[u8; 8] = b"COCFSCFG";
 /// Version 4 uses a root inode ID and removes global data encryption defaults.
 pub const VERSION: u16 = 4;
 pub const MAX_SIZE: usize = 1024 * 1024;
@@ -216,7 +216,7 @@ impl Keyslot {
         self.wrapped_master_key.validate_descriptor()?;
         validate_extensions(&self.extensions)?;
         aad(
-            b"EEDFS/keyslot\0",
+            b"CoCryptFS/keyslot\0",
             &(
                 VERSION,
                 filesystem_id,
@@ -260,7 +260,7 @@ impl Header {
     pub fn protected_aad(&self) -> Result<Vec<u8>> {
         self.validate_public()?;
         aad(
-            b"EEDFS/header-config\0",
+            b"CoCryptFS/header-config\0",
             &(
                 VERSION,
                 self.filesystem_id,

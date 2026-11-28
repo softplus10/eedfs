@@ -1,16 +1,16 @@
 # Offline object inspection and collection
 
-`eedfs gc` reports reachable and unreferenced objects in one volume prefix.
+`cocryptfs gc` reports reachable and unreferenced objects in one volume prefix.
 It does not repair namespace operations, replay writes, restore open files, or
 change any live inode/header. It adds no journal, remote counter, or service.
 
 ```sh
 # Use the same S3 environment as format/mount-s3. Reporting performs no DELETE.
-eedfs gc --prefix test/ --password-file /private/password
+cocryptfs gc --prefix test/ --password-file /private/password
 
 # First stop ALL clients of this volume, including mappings and upload workers.
 # Keep them stopped until the command finishes.
-eedfs gc --prefix test/ --password-file /private/password --offline --delete
+cocryptfs gc --prefix test/ --password-file /private/password --offline --delete
 ```
 
 `--offline` asserts that the operator has stopped every client; it does not stop
@@ -48,7 +48,7 @@ the object. Offline operation remains a necessary precondition.
 
 Each volume must own its prefix exclusively. The header is always retained.
 Unreferenced direct children named with exactly 64 lowercase hexadecimal digits
-are reserved EEDFS objects and are eligible for deletion. Other keys, including
+are reserved CoCryptFS objects and are eligible for deletion. Other keys, including
 nested prefixes and unrelated readable names, are reported as ignored and kept.
 The collector does not decrypt unreachable inode objects before removing them.
 

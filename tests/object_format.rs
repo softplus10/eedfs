@@ -1,4 +1,4 @@
-use eedfs::{
+use cocryptfs::{
     crypto::encryption,
     format::{
         data_chunk::DataChunkObject,
@@ -135,7 +135,8 @@ fn run_limits_and_index_overflow_are_checked_on_decode_too() {
     c.runs[0].plaintext_lengths = vec![0];
     invalid.push(c);
     let mut c = chunks();
-    c.runs[0].plaintext_lengths = vec![eedfs::format::data_chunk::MAX_CHUNK_PLAINTEXT as u32 + 1];
+    c.runs[0].plaintext_lengths =
+        vec![cocryptfs::format::data_chunk::MAX_CHUNK_PLAINTEXT as u32 + 1];
     invalid.push(c);
     let mut c = chunks();
     c.runs[0].plaintext_lengths = vec![1; MAX_CHUNK_REFERENCES + 1];
@@ -149,7 +150,7 @@ fn run_limits_and_index_overflow_are_checked_on_decode_too() {
             ..body()
         };
         assert!(b.encode().is_err());
-        assert!(InodeBody::decode(&unchecked(b"EEDFSINB", &b)).is_err());
+        assert!(InodeBody::decode(&unchecked(b"COCFSINB", &b)).is_err());
     }
 }
 #[test]
@@ -160,7 +161,7 @@ fn inline_limit_kind_extensions_and_debug_redaction() {
     b = body();
     b.content = InodeContent::Inline(vec![0; MAX_INLINE_SIZE + 1]);
     assert!(b.encode().is_err());
-    assert!(InodeBody::decode(&unchecked(b"EEDFSINB", &b)).is_err());
+    assert!(InodeBody::decode(&unchecked(b"COCFSINB", &b)).is_err());
     b = body();
     b.extensions.push(Extension {
         kind: 0x8000,
@@ -251,7 +252,8 @@ fn previous_inode_version_is_rejected_and_lengths_need_no_file_maximum() {
     );
     let mut content = chunks();
     content.runs[0].first_chunk = u64::MAX;
-    content.runs[0].plaintext_lengths = vec![eedfs::format::data_chunk::MAX_CHUNK_PLAINTEXT as u32];
+    content.runs[0].plaintext_lengths =
+        vec![cocryptfs::format::data_chunk::MAX_CHUNK_PLAINTEXT as u32];
     let b = InodeBody {
         content: InodeContent::Chunks(content),
         ..body()
@@ -277,7 +279,7 @@ fn v3_is_explicitly_rejected_after_metadata_schema_change() {
 }
 #[test]
 fn metadata_and_pre_epoch_times_roundtrip_and_are_validated() {
-    use eedfs::format::metadata::{Metadata, Timestamp};
+    use cocryptfs::format::metadata::{Metadata, Timestamp};
     let time = std::time::UNIX_EPOCH - std::time::Duration::new(5, 123);
     let ts = Timestamp::from_system_time(time).unwrap();
     assert_eq!(ts.to_system_time().unwrap(), time);
@@ -294,7 +296,7 @@ fn metadata_and_pre_epoch_times_roundtrip_and_are_validated() {
 
 #[test]
 fn lease_is_directory_only_and_previous_inode_schema_is_rejected() {
-    use eedfs::format::metadata::Timestamp;
+    use cocryptfs::format::metadata::Timestamp;
     let mut b = body();
     b.lease = Some(DirectoryLease {
         owner: [8; 16],
@@ -310,7 +312,7 @@ fn lease_is_directory_only_and_previous_inode_schema_is_rejected() {
     assert!(b.encode().is_err());
     b.lease.as_mut().unwrap().owner = [1; 16];
     b.lease.as_mut().unwrap().expires_at.nanos = 1_000_000_000;
-    assert!(InodeBody::decode(&unchecked(b"EEDFSINB", &b)).is_err());
+    assert!(InodeBody::decode(&unchecked(b"COCFSINB", &b)).is_err());
     let old = include_str!("fixtures/inode-inline-v4.hex")
         .split_whitespace()
         .map(|v| u8::from_str_radix(v, 16).unwrap())

@@ -1,3 +1,3 @@
-# Generated with libsodium 1.0.22 and libargon2; inputs in tests/crypto.rs.
-db874b39c3f2e4c0572156aba536cd863f675ec09ea272991aece73e6d9efad3c8ea03eb6c597647
+# Generated with libsodium 1.0.18 and libargon2; inputs in tests/crypto.rs.
+ddad4c0de9a2f9e860644fa0af37d88d25234dcb89f66b8e1c6e50c4e7def639dfd9e22140f7d3a69b6d2cc0
 f7ff8309c5b730e9290f02b7fe1da817f037631ac327391b38e70a43ef5cdc17

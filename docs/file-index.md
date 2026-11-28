@@ -6,7 +6,7 @@ remain unchanged. Clients reject inode v1–v6; no automatic migration is provid
 Existing experimental volumes need an explicit migration/export using their old
 client, or recreation. Never mix old and new clients on an active volume.
 
-From the current inode v7 baseline onward, preserve backward compatibility:
+From the current CoCryptFS inode v7 baseline onward, preserve backward compatibility:
 new clients must continue reading and writing existing volumes. Routine client
 upgrades must not silently rewrite a volume into a representation its existing
 clients cannot read. Preserve wire tags, cryptographic algorithm IDs, key
@@ -37,10 +37,10 @@ Each tree has at most 1,000,000 records, fanout 128, height at most six, and
 64 KiB plaintext pages. These are format/resource bounds, not verified workload
 scale. `start..end` ranges and child spans are ordered and nonoverlapping;
 child counts and bounds must match the authenticated page. Pages use an
-`EEDFSFPG` v1 frame. Leaf and branch tags are 0/1; extent and version tags are 0/1.
+`COCFSFPG` v1 frame. Leaf and branch tags are 0/1; extent and version tags are 0/1.
 Pages are encrypted with the inode's chunk key/profile and compact chunk v2
 framing. Names use a key derived from the inode key with HKDF label
-`EEDFS/v1/file-index-name`, the HMAC-SHA256 chunk naming domain, a fresh allocation
+`CoCryptFS/v1/file-index-name`, the HMAC-SHA256 chunk naming domain, a fresh allocation
 ID and chunk index zero. File roots never disclose the volume naming key. No unencrypted extent manifest is added.
 
 Extent keys are absolute logical file offsets. Gaps represent sparse zeroes and

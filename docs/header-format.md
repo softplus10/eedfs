@@ -8,7 +8,9 @@ All integers in the 16-byte framing prefix are little endian:
 magic[8] | version:u16 | flags:u16=0 | payload_length:u32 | Postcard payload
 ```
 
-Magic is `EEDFSHDR` for Header and `EEDFSCFG` for decrypted ProtectedConfig.
+Frame magic uses `COCFS` as the compact CoCryptFS prefix, preserving the fixed
+eight-byte field. Magic is `COCFSHDR` for Header and `COCFSCFG` for decrypted
+ProtectedConfig.
 Canonical Postcard encoding is required, including no trailing bytes. Struct
 field order and enum variant order are part of the schema. Rust memory layouts
 are never written to disk. IDs use random 16-byte values, not an allocation counter.
@@ -53,9 +55,9 @@ The root inode carries its own wrapped key; its key is not duplicated here.
 
 AAD is a raw domain prefix followed by the canonical Postcard tuple below:
 
-- `EEDFS/keyslot\0`: `(4, filesystem_id, slot_id, kdf, wrapping_algorithm,
+- `CoCryptFS/keyslot\0`: `(4, filesystem_id, slot_id, kdf, wrapping_algorithm,
   wrapping_nonce, slot_extensions)`.
-- `EEDFS/header-config\0`: `(4, filesystem_id, keyslots, protected_algorithm,
+- `CoCryptFS/header-config\0`: `(4, filesystem_id, keyslots, protected_algorithm,
   protected_nonce, header_extensions)`.
 
 Version is serialized as u16. Wrapped-key ciphertexts are bound by the protected

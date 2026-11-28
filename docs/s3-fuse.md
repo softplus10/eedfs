@@ -33,20 +33,20 @@ Configure `S3_BUCKET`, `S3_ENDPOINT_URL`, `S3_REGION`, `S3_FORCE_PATH_STYLE` as 
 Omit `--password-file` for hidden input on the controlling terminal. `format`
 asks for the new password twice; `mount-s3` and `gc` ask once. `change-password`
 asks for the current password and asks for the new password twice, unless the
-respective `--password-file`/`--new-password-file` is supplied. `EEDFS_PASSWORD_FILE`
+respective `--password-file`/`--new-password-file` is supplied. `COCRYPTFS_PASSWORD_FILE`
 also selects file input. A process with no controlling terminal must supply the
 file options; redirected stdin is not used for password input.
 
 ```sh
 # For unattended use, prepare a private password file outside the repository.
 cargo build --release --locked
-target/release/eedfs format --password-file /private/password --prefix test/
-mkdir -p /tmp/eedfs-mount /private/eedfs-cache
-target/release/eedfs mount-s3 /tmp/eedfs-mount \
+target/release/cocryptfs format --password-file /private/password --prefix test/
+mkdir -p /tmp/cocryptfs-mount /private/cocryptfs-cache
+target/release/cocryptfs mount-s3 /tmp/cocryptfs-mount \
   --password-file /private/password --prefix test/ \
-  --cache-dir /private/eedfs-cache
+  --cache-dir /private/cocryptfs-cache
 # In another terminal: write files, fsync, read them, then unmount.
-fusermount3 -u /tmp/eedfs-mount
+fusermount3 -u /tmp/cocryptfs-mount
 ```
 
 `format` refuses an existing header and never overwrites a volume. The optional
@@ -91,8 +91,8 @@ metadata requests and commits, so local-disk latency should not be expected.
 For a disposable-bucket transfer regression, run:
 
 ```sh
-python3 scripts/check-transfers.py --binary target/release/eedfs \
-  --password-file /private/password --work-dir /tmp/eedfs-transfer-check
+python3 scripts/check-transfers.py --binary target/release/cocryptfs \
+  --password-file /private/password --work-dir /tmp/cocryptfs-transfer-check
 ```
 
 This creates a unique volume, writes a 1 GiB file without an explicit fsync,
@@ -181,7 +181,7 @@ operations after a client process crash.
 ## Directory payload v1
 
 A directory inode has kind=2 and Inline content containing a canonical framed
-Postcard `Directory { entries: Vec<Entry> }`. Magic `EEDFSDIR`, version=1, standard
+Postcard `Directory { entries: Vec<Entry> }`. Magic `COCFSDIR`, version=1, standard
 16-byte prefix. `Entry { name: String, id:[u8;16], kind:u8 }`. Names are UTF-8,
 1–255 bytes, exclude `/`, NUL, `.` and `..`; entries sort strictly by name.
 At most 1,024 entries and 64 KiB encoded fit inline. Larger directories promote
@@ -217,9 +217,9 @@ local cache, key rotation UI or sharing service is included.
 ```sh
 # Existing disposable bucket and credentials required:
 cargo test --locked --test volume_minio -- --ignored --test-threads=1
-python3 scripts/bench-s3-fuse.py --binary target/release/eedfs \
-  --password-file /private/password --work-dir /tmp/eedfs-test \
-  --output /tmp/eedfs-results.json --benchmark --large-mib 10240
+python3 scripts/bench-s3-fuse.py --binary target/release/cocryptfs \
+  --password-file /private/password --work-dir /tmp/cocryptfs-test \
+  --output /tmp/cocryptfs-results.json --benchmark --large-mib 10240
 cargo run --release --locked --example s3_bench -- --mib 1024 --jobs 8
 ```
 

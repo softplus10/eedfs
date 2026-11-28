@@ -36,7 +36,7 @@ pub fn aad(
     expected_len: u32,
 ) -> Result<Vec<u8>> {
     Ok(object_aad(
-        b"EEDFS/data-chunk\0",
+        b"CoCryptFS/data-chunk\0",
         VERSION,
         filesystem_id,
         object_key,

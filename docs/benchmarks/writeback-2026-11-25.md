@@ -84,8 +84,8 @@ With MinIO and the disposable bucket configured as in the [S3/FUSE guide](../s3-
 ```sh
 cargo test --locked --all-targets
 cargo test --locked --test volume_minio -- --ignored --test-threads=1
-cargo build --release --locked --bin eedfs
-python3 scripts/bench-s3-fuse.py --binary target/release/eedfs \
-  --password-file /private/password --work-dir /tmp/eedfs-writeback \
+cargo build --release --locked --bin cocryptfs
+python3 scripts/bench-s3-fuse.py --binary target/release/cocryptfs \
+  --password-file /private/password --work-dir /tmp/cocryptfs-writeback \
   --output /tmp/writeback.json --benchmark --large-mib 10240
 ```

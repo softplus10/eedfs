@@ -12,11 +12,11 @@ pub enum Purpose {
 impl Purpose {
     fn label(&self) -> &'static [u8] {
         match self {
-            Self::Header => b"EEDFS/v1/header-config",
-            Self::InodeWrapping => b"EEDFS/v1/inode-wrapping",
-            Self::InodeBody => b"EEDFS/v1/inode-body",
-            Self::DataChunk => b"EEDFS/v1/data-chunk",
-            Self::FileIndexNaming => b"EEDFS/v1/file-index-name",
+            Self::Header => b"CoCryptFS/v1/header-config",
+            Self::InodeWrapping => b"CoCryptFS/v1/inode-wrapping",
+            Self::InodeBody => b"CoCryptFS/v1/inode-body",
+            Self::DataChunk => b"CoCryptFS/v1/data-chunk",
+            Self::FileIndexNaming => b"CoCryptFS/v1/file-index-name",
         }
     }
 }

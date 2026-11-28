@@ -1,6 +1,6 @@
 //! Reproducible CPU/memory microbenchmark; no S3, disk or FUSE I/O.
 use clap::Parser;
-use eedfs::{
+use cocryptfs::{
     crypto::{SecretKey, encryption as enc, kdf, naming, objects},
     format::{header::NamingConfig, inode::*},
 };

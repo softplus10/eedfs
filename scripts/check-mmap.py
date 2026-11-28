@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise mmap/msync on three mounted clients of one disposable EEDFS volume."""
+"""Exercise mmap/msync on three mounted clients of one disposable CoCryptFS volume."""
 import ctypes
 import errno
 import mmap

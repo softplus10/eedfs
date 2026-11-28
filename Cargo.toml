@@ -1,10 +1,10 @@
 [package]
-name = "eedfs"
+name = "cocryptfs"
 version = "0.1.0"
 edition = "2024"
 license = "Unlicense"
-description = "End-to-end encrypted distributed filesystem"
-repository = "https://github.com/softplus10/eedfs"
+description = "Client-side encrypted filesystem with concurrent multi-client access"
+repository = "https://github.com/softplus10/cocryptfs"
 publish = false
 
 [dependencies]

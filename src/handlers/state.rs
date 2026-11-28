@@ -1,5 +1,5 @@
 //! Writable adapter. Close queues writeback; fsync acknowledges S3 persistence.
-use eedfs::{
+use cocryptfs::{
     format::{directory::Entry, inode, metadata::Metadata},
     volume::{Error, FileSession, Loaded, Volume, snapshots::Snapshots, writeback::Writeback},
 };
@@ -26,7 +26,7 @@ struct OpenFile {
     id: [u8; 16],
     generation: Option<u64>,
     ino: u64,
-    _memory: eedfs::volume::resources::Memory,
+    _memory: cocryptfs::volume::resources::Memory,
 }
 struct LocalFile {
     session: Weak<Mutex<FileSession>>,
@@ -40,7 +40,7 @@ pub(super) struct DirCursor {
     pub parent: INodeNo,
     pub offset: u64,
     pub after: Option<String>,
-    pub _memory: Arc<eedfs::volume::resources::Memory>,
+    pub _memory: Arc<cocryptfs::volume::resources::Memory>,
 }
 pub(super) struct State {
     pub(super) nodes: HashMap<u64, Node>,

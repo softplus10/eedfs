@@ -170,10 +170,10 @@ impl Page {
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        codec::frame(b"EEDFSFPG", 1, MAX_INLINE_SIZE, self)
+        codec::frame(b"COCFSFPG", 1, MAX_INLINE_SIZE, self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let p: Self = codec::unframe(b"EEDFSFPG", 1, MAX_INLINE_SIZE, bytes)?;
+        let p: Self = codec::unframe(b"COCFSFPG", 1, MAX_INLINE_SIZE, bytes)?;
         p.validate()?;
         Ok(p)
     }

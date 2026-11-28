@@ -46,12 +46,12 @@ fn run_checks(statuses: &[&str]) -> (std::process::Output, String) {
         }
         requests
     });
-    let output = Command::new(env!("CARGO_BIN_EXE_eedfs"))
+    let output = Command::new(env!("CARGO_BIN_EXE_cocryptfs"))
         .args([
             "s3",
             "check",
             "--bucket",
-            "eedfs-test",
+            "cocryptfs-test",
             "--region",
             "us-east-1",
             "--endpoint-url",
@@ -60,8 +60,8 @@ fn run_checks(statuses: &[&str]) -> (std::process::Output, String) {
             "--timeout-seconds",
             "5",
         ])
-        .env("S3_ACCESS_KEY_ID", "eedfs-test-key")
-        .env("S3_SECRET_ACCESS_KEY", "eedfs-test-secret")
+        .env("S3_ACCESS_KEY_ID", "cocryptfs-test-key")
+        .env("S3_SECRET_ACCESS_KEY", "cocryptfs-test-secret")
         .env("AWS_EC2_METADATA_DISABLED", "true")
         .env_remove("AWS_PROFILE")
         .env_remove("AWS_SESSION_TOKEN")
@@ -82,7 +82,7 @@ fn bucket_check_retries_transient_service_failure() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(requests.matches("HEAD /eedfs-test/").count(), 2);
+    assert_eq!(requests.matches("HEAD /cocryptfs-test/").count(), 2);
 }
 
 #[test]
@@ -94,12 +94,12 @@ fn bucket_check_sends_signed_head_without_writing() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        request.starts_with("HEAD /eedfs-test/ HTTP/1.1\r\n"),
+        request.starts_with("HEAD /cocryptfs-test/ HTTP/1.1\r\n"),
         "{request}"
     );
     let headers = request.to_ascii_lowercase();
     assert!(headers.contains("authorization: aws4-hmac-sha256 "));
-    assert!(headers.contains("credential=eedfs-test-key/"));
+    assert!(headers.contains("credential=cocryptfs-test-key/"));
     assert!(headers.contains("/us-east-1/s3/aws4_request"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("S3 bucket access verified"));
 }
@@ -113,8 +113,15 @@ fn bucket_access_denied_is_a_failure() {
 
 #[test]
 fn partial_credentials_are_rejected() {
-    let output = Command::new(env!("CARGO_BIN_EXE_eedfs"))
-        .args(["s3", "check", "--bucket", "eedfs-test", "--region", "auto"])
+    let output = Command::new(env!("CARGO_BIN_EXE_cocryptfs"))
+        .args([
+            "s3",
+            "check",
+            "--bucket",
+            "cocryptfs-test",
+            "--region",
+            "auto",
+        ])
         .env("S3_ACCESS_KEY_ID", "incomplete-test-key")
         .env_remove("S3_SECRET_ACCESS_KEY")
         .env_remove("S3_SESSION_TOKEN")
@@ -130,8 +137,8 @@ fn partial_credentials_are_rejected() {
 
 #[test]
 fn aws_credentials_are_not_used_as_a_fallback() {
-    let output = Command::new(env!("CARGO_BIN_EXE_eedfs"))
-        .args(["s3", "check", "--bucket", "eedfs-test"])
+    let output = Command::new(env!("CARGO_BIN_EXE_cocryptfs"))
+        .args(["s3", "check", "--bucket", "cocryptfs-test"])
         .env_remove("S3_ACCESS_KEY_ID")
         .env_remove("S3_SECRET_ACCESS_KEY")
         .env_remove("S3_SESSION_TOKEN")

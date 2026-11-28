@@ -11,7 +11,7 @@ argon = ctypes.CDLL(ctypes.util.find_library("argon2") or "libargon2.so.1")
 sodium.sodium_init()
 sodium.sodium_version_string.restype = ctypes.c_char_p
 key, nonce = bytes(range(32)), bytes(range(24))
-message = b"EEDFS independent vector"
+message = b"CoCryptFS independent vector"
 aad = b"filesystem/object/context"
 out = ctypes.create_string_buffer(len(message) + 16)
 length = ctypes.c_ulonglong()

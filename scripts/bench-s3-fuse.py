@@ -6,7 +6,7 @@ Creates a unique prefix and leaves it behind; file commits retire excluded chunk
 import argparse, concurrent.futures, errno, hashlib, json, os, pathlib, random, stat, subprocess, sys, threading, time, uuid
 
 p=argparse.ArgumentParser(description=__doc__)
-p.add_argument('--binary',default='target/release/eedfs')
+p.add_argument('--binary',default='target/release/cocryptfs')
 p.add_argument('--password-file',required=True)
 p.add_argument('--work-dir',required=True)
 p.add_argument('--benchmark',action='store_true')

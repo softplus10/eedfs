@@ -1,4 +1,4 @@
-use eedfs::format::{
+use cocryptfs::format::{
     directory::{Directory, Entry},
     directory_tree::{Child, FANOUT, MAX_ENTRIES, MAX_HEIGHT, Page, PageRef, Root},
     inode,
@@ -28,7 +28,7 @@ fn directory_roots_and_pages_roundtrip_and_old_inline_reader_rejects_tree() {
         Page::Branch(vec![child("a"), child("b")]),
     ] {
         let bytes = page.encode().unwrap();
-        assert_eq!(&bytes[..10], b"EEDFSDPG\x01\x00");
+        assert_eq!(&bytes[..10], b"COCFSDPG\x01\x00");
         assert_eq!(Page::decode(&bytes).unwrap(), page);
         for end in 0..bytes.len() {
             assert!(Page::decode(&bytes[..end]).is_err());

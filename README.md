@@ -1,8 +1,8 @@
-# EEDFS
+# CoCryptFS
 
-End-to-end encrypted distributed filesystem. **Early development.**
+Client-side encrypted filesystem with concurrent multi-client access. **Early development.**
 
-EEDFS is a Rust/FUSE filesystem targeting shared, S3-compatible object storage.
+CoCryptFS is a Rust/FUSE filesystem targeting shared, S3-compatible object storage.
 The experimental `format` / `mount-s3` commands provide encrypted S3-backed
 file and directory operations, fsync commits and remount persistence. The older
 `mount` command remains a read-only development scaffold. See the
@@ -27,7 +27,7 @@ the [mapping contract](docs/memory-mapping.md) for durability and remote conflic
 
 ## Development environment
 
-Use Linux, Rust stable, a C linker, and the FUSE 3 runtime. EEDFS uses `fuser`'s
+Use Linux, Rust stable, a C linker, and the FUSE 3 runtime. CoCryptFS uses `fuser`'s
 pure Rust mount implementation; libfuse development headers are not required.
 
 ```sh
@@ -65,9 +65,9 @@ For S3-compatible providers supporting Signature Version 4, set `S3_ACCESS_KEY_I
 `S3_SECRET_ACCESS_KEY` to the credentials issued by that provider. Set
 `S3_SESSION_TOKEN` as well when using temporary credentials. Both keys must be
 provided together; incomplete or empty values are rejected. Credentials are not
-accepted as CLI arguments or stored by EEDFS. Do not commit credentials.
+accepted as CLI arguments or stored by CoCryptFS. Do not commit credentials.
 
-Only these explicit S3 credentials are used. EEDFS does not load AWS profiles,
+Only these explicit S3 credentials are used. CoCryptFS does not load AWS profiles,
 SSO, workload roles, or instance metadata, and it ignores `AWS_*` credentials.
 The AWS SDK is used as an S3 protocol client; no AWS account is needed for
 non-AWS providers.
@@ -150,7 +150,7 @@ rejected. Basic POSIX attributes and password changes are included; master-key
 rotation and revocation remain future work. The cryptographic integration has
 not received a security audit.
 
-Future changes must preserve read/write compatibility with current v7 volumes.
+Future changes must preserve read/write compatibility with current CoCryptFS v7 volumes.
 Routine upgrades must keep them usable by existing clients; incompatible format
 changes require explicit opt-in migration. See the [format compatibility
 policy](docs/file-index.md).
@@ -159,13 +159,13 @@ policy](docs/file-index.md).
 
 With the S3 connection environment already configured:
 
-Run `eedfs change-password --prefix test/` to enter the current and new passwords
+Run `cocryptfs change-password --prefix test/` to enter the current and new passwords
 with terminal echo disabled. New passwords are entered twice. `format`,
 `mount-s3`, and `gc` also prompt when `--password-file` (or
-`EEDFS_PASSWORD_FILE`) is omitted. For unattended use, provide password files:
+`COCRYPTFS_PASSWORD_FILE`) is omitted. For unattended use, provide password files:
 
 ```sh
-eedfs change-password --prefix test/ \
+cocryptfs change-password --prefix test/ \
   --password-file /private/old-password \
   --new-password-file /private/new-password
 ```
@@ -186,7 +186,7 @@ format and cryptographic implementation groups.
 
 The [writeback contract](docs/writeback.md) defines background upload during writes,
 partial fsync and append, retained errors, asynchronous close and shutdown drain. No stored format
-change is required. Public S3 transport types now live under `eedfs::storage::s3`. The
+change is required. Public S3 transport types now live under `cocryptfs::storage::s3`. The
 [streaming writeback validation](docs/benchmarks/writeback-2026-11-25.md) records
 mid-stream fsync/close checks, fault injection and a mounted 10 GiB run.
 

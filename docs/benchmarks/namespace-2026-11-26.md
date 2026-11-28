@@ -92,8 +92,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --release --locked
 cargo test --locked --test volume_minio -- --ignored --test-threads=1
-python3 scripts/bench-s3-fuse.py --binary target/release/eedfs \
-  --password-file /private/password --work-dir /tmp/eedfs-namespace \
-  --output /tmp/eedfs-namespace.json --benchmark --large-mib 10240
+python3 scripts/bench-s3-fuse.py --binary target/release/cocryptfs \
+  --password-file /private/password --work-dir /tmp/cocryptfs-namespace \
+  --output /tmp/cocryptfs-namespace.json --benchmark --large-mib 10240
 ./scripts/smoke-fuse.sh
 ```

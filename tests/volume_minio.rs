@@ -1,5 +1,5 @@
 //! Requires a disposable S3 bucket. Run explicitly with --ignored --test-threads=1.
-use eedfs::{
+use cocryptfs::{
     crypto,
     format::{
         directory::{Directory, Entry},
@@ -74,7 +74,7 @@ async fn conditional_put_rejects_stale_versions() {
 #[tokio::test]
 #[ignore = "requires a disposable real S3/MinIO bucket"]
 async fn offline_gc_reports_sweeps_and_preserves_live_data() {
-    use eedfs::volume::GcOptions;
+    use cocryptfs::volume::GcOptions;
     let c = connection();
     let prefix = prefix();
     let volume = Volume::format(c.clone(), prefix.clone(), b"gc integration", 128 * 1024, 4)
@@ -85,7 +85,7 @@ async fn offline_gc_reports_sweeps_and_preserves_live_data() {
         .await
         .unwrap();
     let id = loaded.body.id;
-    let cache = std::env::temp_dir().join(format!("eedfs-gc-{}", std::process::id()));
+    let cache = std::env::temp_dir().join(format!("cocryptfs-gc-{}", std::process::id()));
     let mut file = volume.file(loaded, &cache).unwrap();
     file.write(0, &vec![7; 150_000]).await.unwrap();
     file.commit().await.unwrap();
@@ -146,7 +146,7 @@ async fn persistence_cow_sparse_truncate_conflicts_and_directory_merge() {
             .await
             .is_err()
     );
-    let cache = std::env::temp_dir().join(format!("eedfs-test-{}", std::process::id()));
+    let cache = std::env::temp_dir().join(format!("cocryptfs-test-{}", std::process::id()));
     let loaded = volume
         .create(volume.root, "data", inode::FILE)
         .await
@@ -229,7 +229,7 @@ async fn partial_fsync_append_keeps_previously_committed_chunk_references() {
     let volume = Volume::format(connection(), prefix(), b"append test", 8 * 1024 * 1024, 4)
         .await
         .unwrap();
-    let cache = std::env::temp_dir().join(format!("eedfs-append-{}", std::process::id()));
+    let cache = std::env::temp_dir().join(format!("cocryptfs-append-{}", std::process::id()));
     let loaded = volume
         .create(volume.root, "append", inode::FILE)
         .await
@@ -279,7 +279,7 @@ async fn three_clients_merge_disjoint_bytes_and_refresh_retired_reader_snapshot(
     let third = Volume::open(c, prefix, password, 128 * 1024, 4)
         .await
         .unwrap();
-    let cache = std::env::temp_dir().join(format!("eedfs-merge-{}", std::process::id()));
+    let cache = std::env::temp_dir().join(format!("cocryptfs-merge-{}", std::process::id()));
     let loaded = first
         .create(first.root, "shared", inode::FILE)
         .await
@@ -290,7 +290,7 @@ async fn three_clients_merge_disjoint_bytes_and_refresh_retired_reader_snapshot(
     original.commit().await.unwrap();
     let snapshot = third.load(id).await.unwrap();
     let mut reader = third.file(snapshot.clone(), &cache).unwrap();
-    let pins = eedfs::volume::snapshots::Snapshots::new(third.clone());
+    let pins = cocryptfs::volume::snapshots::Snapshots::new(third.clone());
     pins.pin(&snapshot);
     let mut a = first.file(first.load(id).await.unwrap(), &cache).unwrap();
     let mut b = second.file(second.load(id).await.unwrap(), &cache).unwrap();

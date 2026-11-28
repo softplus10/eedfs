@@ -51,7 +51,7 @@ impl Child {
 }
 impl Root {
     pub fn is_tree(bytes: &[u8]) -> bool {
-        bytes.get(..10) == Some(b"EEDFSDIR\x02\x00")
+        bytes.get(..10) == Some(b"COCFSDIR\x02\x00")
     }
     fn validate(&self) -> Result<()> {
         self.child.validate()?;
@@ -62,10 +62,10 @@ impl Root {
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        codec::frame(b"EEDFSDIR", 2, MAX_INLINE_SIZE, self)
+        codec::frame(b"COCFSDIR", 2, MAX_INLINE_SIZE, self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let root: Self = codec::unframe(b"EEDFSDIR", 2, MAX_INLINE_SIZE, bytes)?;
+        let root: Self = codec::unframe(b"COCFSDIR", 2, MAX_INLINE_SIZE, bytes)?;
         root.validate()?;
         Ok(root)
     }
@@ -103,10 +103,10 @@ impl Page {
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        codec::frame(b"EEDFSDPG", 1, MAX_INLINE_SIZE, self)
+        codec::frame(b"COCFSDPG", 1, MAX_INLINE_SIZE, self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let page: Self = codec::unframe(b"EEDFSDPG", 1, MAX_INLINE_SIZE, bytes)?;
+        let page: Self = codec::unframe(b"COCFSDPG", 1, MAX_INLINE_SIZE, bytes)?;
         page.validate()?;
         Ok(page)
     }

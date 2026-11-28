@@ -58,7 +58,7 @@ directories still decode their bounded inline payload.
 ## Remote current-object usage
 
 ```sh
-eedfs s3 usage --prefix test/
+cocryptfs s3 usage --prefix test/
 ```
 
 With the normal S3 environment configured, this read-only command sums current

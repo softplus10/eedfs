@@ -478,7 +478,7 @@ impl Volume {
         }
         std::fs::create_dir_all(cache_dir)?;
         let path = cache_dir.join(format!(
-            "eedfs-{}",
+            "cocryptfs-{}",
             naming::inode(&self.names, &self.fs_id, &crypto::random_array()?)?
         ));
         let file = OpenOptions::new()

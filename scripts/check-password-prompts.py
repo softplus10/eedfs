@@ -14,7 +14,7 @@ import time
 
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 env = os.environ.copy()
-for key in ('S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_SESSION_TOKEN', 'EEDFS_PASSWORD_FILE'):
+for key in ('S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_SESSION_TOKEN', 'COCRYPTFS_PASSWORD_FILE'):
     env.pop(key, None)
 env['RUST_LOG'] = 'off'
 base = ['--bucket', 'prompt-test']

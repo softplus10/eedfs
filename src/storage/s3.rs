@@ -160,7 +160,7 @@ impl Connection {
     }
 }
 
-/// Use only the provider-issued credentials explicitly configured for EEDFS.
+/// Use only the provider-issued credentials explicitly configured for CoCryptFS.
 /// No AWS profiles, role discovery, or instance metadata lookups are performed.
 fn s3_credentials() -> Result<Credentials, ConnectionError> {
     fn read(name: &str) -> Result<Option<String>, ConnectionError> {
@@ -180,7 +180,7 @@ fn s3_credentials() -> Result<Credentials, ConnectionError> {
             secret,
             token,
             None,
-            "EEDFS environment",
+            "CoCryptFS environment",
         )),
         _ => Err(
             "set both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY; S3_SESSION_TOKEN is optional"

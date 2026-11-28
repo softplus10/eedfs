@@ -1,4 +1,4 @@
-use eedfs::format::{file_index::*, header::NamingConfig};
+use cocryptfs::format::{file_index::*, header::NamingConfig};
 fn child() -> Child {
     Child {
         first: 0,
@@ -63,7 +63,7 @@ fn file_index_summaries_reject_impossible_layouts_and_old_inode_v6() {
         size: 0,
         allocated: 0,
         naming: NamingConfig {
-            algorithm: eedfs::crypto::naming::algorithm().unwrap(),
+            algorithm: cocryptfs::crypto::naming::algorithm().unwrap(),
             key: [3; 32],
         },
         extents: None,
@@ -84,5 +84,5 @@ fn file_index_summaries_reject_impossible_layouts_and_old_inode_v6() {
         .split_whitespace()
         .map(|s| u8::from_str_radix(s, 16).unwrap())
         .collect();
-    assert!(eedfs::format::inode::InodeBody::decode(&old).is_err());
+    assert!(cocryptfs::format::inode::InodeBody::decode(&old).is_err());
 }

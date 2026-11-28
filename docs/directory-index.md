@@ -1,10 +1,10 @@
 # Encrypted directory index
 
-Small directories retain the existing `EEDFSDIR` v1 sorted inline payload, at
+Small directories retain the existing `COCFSDIR` v1 sorted inline payload, at
 most 1,024 entries and 64 KiB encoded. An edit exceeding either bound promotes
 the directory to an immutable B+tree. Names remain UTF-8 and 1–255 bytes.
 
-The directory inode still uses inode v7 with Inline content. An `EEDFSDIR` v2
+The directory inode still uses inode v7 with Inline content. A `COCFSDIR` v2
 root descriptor replaces the v1 payload for indexed directories:
 
 ```
@@ -17,7 +17,7 @@ PageRef { id:[u8;16], len:u32 }
 The current policy bounds a directory to 1,000,000 entries and height to six.
 This is a format/resource limit, not a benchmark claim for that scale.
 
-Each page has an `EEDFSDPG` v1 frame containing a fixed-tag Postcard enum:
+Each page has a `COCFSDPG` v1 frame containing a fixed-tag Postcard enum:
 `Leaf(Vec<Entry>)` (tag 0) or `Branch(Vec<Child>)` (tag 1). Leaves and branches
 contain 1–64 items in strict name order, with a 64 KiB plaintext cap. Reference
 lengths, depth, name ordering and total listing counts are checked. Listing also

@@ -1,4 +1,4 @@
-use eedfs::format::header::{
+use cocryptfs::format::header::{
     Algorithm, Extension, FormatError, Header, Keyslot, MAX_PARAMETERS, MAX_SIZE, NamingConfig,
     ProtectedConfig, SealedRegion, VERSION,
 };
@@ -110,7 +110,7 @@ fn rejects_unknown_required_extensions() {
     value.extensions[0].required = true;
     assert_eq!(value.encode(), Err(FormatError::RequiredExtension(0x8001)));
     assert_eq!(
-        Header::decode(&unchecked_frame(b"EEDFSHDR", &value)),
+        Header::decode(&unchecked_frame(b"COCFSHDR", &value)),
         Err(FormatError::RequiredExtension(0x8001))
     );
 }
@@ -154,7 +154,7 @@ fn rejects_bad_framing_and_unbounded_lengths_before_allocation() {
     let mut body = vec![0x11; 16];
     body.extend_from_slice(&[0xff; 9]);
     body.push(1);
-    assert!(Header::decode(&frame_body(b"EEDFSHDR", &body)).is_err());
+    assert!(Header::decode(&frame_body(b"COCFSHDR", &body)).is_err());
     assert_eq!(
         Header::decode(&vec![0; MAX_SIZE + 1]),
         Err(FormatError::TooLarge)
@@ -166,7 +166,7 @@ fn rejects_duplicate_slots_on_encode_and_decode() {
     let mut value = header();
     value.keyslots.push(value.keyslots[0].clone());
     assert!(value.encode().is_err());
-    assert!(Header::decode(&unchecked_frame(b"EEDFSHDR", &value)).is_err());
+    assert!(Header::decode(&unchecked_frame(b"COCFSHDR", &value)).is_err());
     value.keyslots.clear();
     assert!(value.encode().is_err());
 }
@@ -308,7 +308,7 @@ fn old_experimental_formats_are_rejected_explicitly() {
 fn rejects_oversized_deserialized_parameters_and_roots() {
     let mut value = header();
     value.keyslots[0].kdf.parameters = vec![0; MAX_PARAMETERS + 1];
-    assert!(Header::decode(&unchecked_frame(b"EEDFSHDR", &value)).is_err());
+    assert!(Header::decode(&unchecked_frame(b"COCFSHDR", &value)).is_err());
     let mut bytes = config().encode().unwrap();
     bytes.remove(16);
     assert!(ProtectedConfig::decode(&bytes).is_err());
@@ -398,11 +398,11 @@ fn invalid_naming_descriptors_are_rejected_on_encode_and_decode() {
     let mut value = config();
     value.naming.algorithm.id = 0;
     assert!(value.encode().is_err());
-    assert!(ProtectedConfig::decode(&unchecked_frame(b"EEDFSCFG", &value)).is_err());
+    assert!(ProtectedConfig::decode(&unchecked_frame(b"COCFSCFG", &value)).is_err());
     value.naming.algorithm.id = 1;
     value.naming.algorithm.parameters = vec![0; MAX_PARAMETERS + 1];
     assert!(value.encode().is_err());
-    assert!(ProtectedConfig::decode(&unchecked_frame(b"EEDFSCFG", &value)).is_err());
+    assert!(ProtectedConfig::decode(&unchecked_frame(b"COCFSCFG", &value)).is_err());
 }
 
 #[test]

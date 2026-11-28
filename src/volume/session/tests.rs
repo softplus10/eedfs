@@ -113,7 +113,7 @@ impl Server {
             }
         });
         let cache = std::env::temp_dir().join(format!(
-            "eedfs-pipeline-{:x}",
+            "cocryptfs-pipeline-{:x}",
             u128::from_le_bytes(crypto::random_array().unwrap())
         ));
         Self {

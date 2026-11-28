@@ -1,4 +1,4 @@
-use eedfs::{
+use cocryptfs::{
     crypto::{self, SecretKey, encryption as enc, kdf, naming, objects},
     format::{
         header::{Header, NamingConfig},
@@ -266,7 +266,7 @@ fn domains_and_contexts_are_distinct() {
 fn untrusted_resource_requests_and_unknown_suites_are_rejected() {
     let mut p = params();
     p.memory_kib = u32::MAX;
-    let descriptor = eedfs::format::header::Algorithm::from_parameters(1, 1, &p).unwrap();
+    let descriptor = cocryptfs::format::header::Algorithm::from_parameters(1, 1, &p).unwrap();
     assert!(kdf::argon2id::derive(b"password", &descriptor).is_err());
     assert!(enc::algorithm(999).is_err());
     let mut a = enc::algorithm(1).unwrap();
@@ -281,7 +281,7 @@ fn independent_libsodium_and_libargon2_vectors() {
         .filter(|l| !l.starts_with('#'));
     let key = SecretKey::from_bytes(std::array::from_fn(|i| i as u8));
     let nonce: Vec<u8> = (0..24).collect();
-    let mut msg = b"EEDFS independent vector".to_vec();
+    let mut msg = b"CoCryptFS independent vector".to_vec();
     enc::encrypt_in_place(
         &enc::algorithm(1).unwrap(),
         &key,

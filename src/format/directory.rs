@@ -22,10 +22,10 @@ impl Directory {
     }
     pub fn encode(&self) -> Result<Vec<u8>, FormatError> {
         self.validate()?;
-        codec::frame(b"EEDFSDIR", 1, MAX_INLINE_SIZE, self)
+        codec::frame(b"COCFSDIR", 1, MAX_INLINE_SIZE, self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
-        let d: Self = codec::unframe(b"EEDFSDIR", 1, MAX_INLINE_SIZE, bytes)?;
+        let d: Self = codec::unframe(b"COCFSDIR", 1, MAX_INLINE_SIZE, bytes)?;
         d.validate()?;
         Ok(d)
     }

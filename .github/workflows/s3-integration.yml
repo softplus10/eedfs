@@ -7,13 +7,13 @@ jobs:
   minio:
     runs-on: ubuntu-latest
     env:
-      S3_ACCESS_KEY_ID: eedfs-integration
+      S3_ACCESS_KEY_ID: cocryptfs-integration
       S3_SECRET_ACCESS_KEY: disposable-loopback-test-only
       S3_ENDPOINT_URL: http://127.0.0.1:19000
       S3_REGION: us-east-1
       S3_FORCE_PATH_STYLE: 'true'
-      S3_BUCKET: eedfs-integration
-      MINIO_ROOT_USER: eedfs-integration
+      S3_BUCKET: cocryptfs-integration
+      MINIO_ROOT_USER: cocryptfs-integration
       MINIO_ROOT_PASSWORD: disposable-loopback-test-only
     steps:
       - uses: actions/checkout@v4
@@ -40,9 +40,9 @@ jobs:
         run: |
           printf 'integration password\n' > "$RUNNER_TEMP/password"
           chmod 600 "$RUNNER_TEMP/password"
-          target/debug/eedfs format --password-file "$RUNNER_TEMP/password" --prefix setup/ --create-bucket
+          target/debug/cocryptfs format --password-file "$RUNNER_TEMP/password" --prefix setup/ --create-bucket
       - run: cargo test --locked --test volume_minio -- --ignored --test-threads=1
       - name: Three mounted clients
         run: |
           sudo modprobe fuse
-          python3 scripts/bench-s3-fuse.py --binary target/debug/eedfs --password-file "$RUNNER_TEMP/password" --work-dir "$RUNNER_TEMP/fuse-test" --output "$RUNNER_TEMP/result.json"
+          python3 scripts/bench-s3-fuse.py --binary target/debug/cocryptfs --password-file "$RUNNER_TEMP/password" --work-dir "$RUNNER_TEMP/fuse-test" --output "$RUNNER_TEMP/result.json"

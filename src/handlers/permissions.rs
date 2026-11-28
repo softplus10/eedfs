@@ -1,5 +1,5 @@
 //! Local numeric credentials only; no cross-client identity/account lookup.
-use eedfs::volume::Error;
+use cocryptfs::volume::Error;
 use fuser::Request;
 pub(super) fn actor(req: &Request, gid: Option<u32>) -> Result<(u32, u32), Error> {
     let uid = req.uid().ok_or(Error::Permission)?;
